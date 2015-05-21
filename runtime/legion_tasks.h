@@ -267,6 +267,9 @@ namespace LegionRuntime {
       void deactivate_single(void);
     public:
       virtual void trigger_dependence_analysis(void) = 0;
+      virtual void profiler_feedback(GenerationID gen_profiled, 
+                                     int attempt_profiled,
+				     const ProfilingResponse& pr);
     public:
       // This is used enough that we want it inlined
       inline Processor get_executing_processor(void) const

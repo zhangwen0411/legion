@@ -30,6 +30,9 @@ using namespace LegionRuntime::Accessor;
 
 #include "lowlevel_dma.h"
 
+#include "realm/profiling.h"
+#include "realm/faults.h"
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -60,7 +63,6 @@ static void *bytedup(const void *data, size_t datalen)
 namespace LegionRuntime {
   namespace LowLevel {
 
-    GASNETT_THREADKEY_DEFINE(cur_thread);
     GASNETT_THREADKEY_DEFINE(cur_preemptable_thread);
 #ifdef USE_CUDA
     GASNETT_THREADKEY_DECLARE(gpu_thread_ptr);
@@ -88,6 +90,7 @@ namespace LegionRuntime {
       LOCK_GRANT_MSGID,
       EVENT_SUBSCRIBE_MSGID,
       EVENT_TRIGGER_MSGID,
+      EVENT_UPDATE_MSGID,
       REMOTE_MALLOC_MSGID,
       REMOTE_MALLOC_RPLID,
       CREATE_ALLOC_MSGID,
@@ -594,7 +597,6 @@ namespace LegionRuntime {
       valid_mask = 0;
       valid_mask_complete = false;
       valid_mask_event = Event::NO_EVENT;
-      valid_mask_event_impl = 0;
       gasnet_hsl_init(&valid_mask_mutex);
     }
 
@@ -614,7 +616,6 @@ namespace LegionRuntime {
 		    new ElementMask(_num_elmts));
       valid_mask_complete = true;
       valid_mask_event = Event::NO_EVENT;
-      valid_mask_event_impl = 0;
       gasnet_hsl_init(&valid_mask_mutex);
       if(_frozen) {
 	avail_mask = 0;
@@ -695,7 +696,6 @@ namespace LegionRuntime {
       size_t num_elmts = StaticAccess<IndexSpace::Impl>(this)->num_elmts;
       int valid_mask_owner = -1;
       
-      Event e;
       {
 	AutoHSLLock a(valid_mask_mutex);
 	
@@ -709,9 +709,7 @@ namespace LegionRuntime {
 	valid_mask_owner = ID(me).node(); // a good guess?
 	valid_mask_count = (valid_mask->raw_size() + 2047) >> 11;
 	valid_mask_complete = false;
-	valid_mask_event_impl = GenEventImpl::create_genevent();
-        valid_mask_event = valid_mask_event_impl->current_event();
-        e = valid_mask_event;
+	valid_mask_event = GenEventImpl::create_genevent()->current_event();
       }
       
       ValidMaskRequestArgs args;
@@ -719,7 +717,7 @@ namespace LegionRuntime {
       args.sender = gasnet_mynode();
       ValidMaskRequestMessage::request(valid_mask_owner, args);
 
-      return e;
+      return valid_mask_event;
     }
 
     void handle_valid_mask_request(ValidMaskRequestArgs args)
@@ -768,7 +766,7 @@ namespace LegionRuntime {
 
       memcpy(mask_data + (args.block_id << 11), data, datalen);
 
-      GenEventImpl *to_trigger = 0;
+      Event to_trigger = Event::NO_EVENT;
       {
 	AutoHSLLock a(r_impl->valid_mask_mutex);
 	//printf("got piece of valid mask data for region " IDFMT " (%d expected)\n",
@@ -776,15 +774,15 @@ namespace LegionRuntime {
 	r_impl->valid_mask_count--;
         if(r_impl->valid_mask_count == 0) {
 	  r_impl->valid_mask_complete = true;
-	  to_trigger = r_impl->valid_mask_event_impl;
-	  r_impl->valid_mask_event_impl = 0;
+	  to_trigger = r_impl->valid_mask_event;
+	  r_impl->valid_mask_event = Event::NO_EVENT;
 	}
       }
 
-      if(to_trigger) {
+      if(to_trigger.exists()) {
 	//printf("triggering " IDFMT "/%d\n",
 	//       r_impl->valid_mask_event.id, r_impl->valid_mask_event.gen);
-	to_trigger->trigger_current();
+	GenEventImpl::local_trigger(to_trigger, false /*not poisoned*/);
       }
     }
     
@@ -810,7 +808,7 @@ namespace LegionRuntime {
     Logger::Category log_metadata("metadata");
 
     MetadataBase::MetadataBase(void)
-      : state(STATE_INVALID), valid_event_impl(0)
+      : state(STATE_INVALID), valid_event(Event::NO_EVENT)
     {}
 
     MetadataBase::~MetadataBase(void)
@@ -837,15 +835,15 @@ namespace LegionRuntime {
     {
       // update the state, and
       // if there was an event, we'll trigger it
-      GenEventImpl *to_trigger = 0;
+      Event to_trigger = Event::NO_EVENT;
       {
 	AutoHSLLock a(mutex);
 
 	switch(state) {
 	case STATE_REQUESTED:
 	  {
-	    to_trigger = valid_event_impl;
-	    valid_event_impl = 0;
+	    to_trigger = valid_event;
+	    valid_event = Event::NO_EVENT;
 	    state = STATE_VALID;
 	    break;
 	  }
@@ -855,8 +853,8 @@ namespace LegionRuntime {
 	}
       }
 
-      if(to_trigger)
-	to_trigger->trigger_current();
+      if(to_trigger.exists())
+	GenEventImpl::local_trigger(to_trigger, false /*not poisoned*/);
     }
 
     struct MetadataRequestMessage {
@@ -947,7 +945,6 @@ namespace LegionRuntime {
       // sanity-check - should never be requesting data from ourselves
       assert(((unsigned)owner) != gasnet_mynode());
 
-      Event e = Event::NO_EVENT;
       bool issue_request = false;
       {
 	AutoHSLLock a(mutex);
@@ -964,8 +961,7 @@ namespace LegionRuntime {
 	  {
 	    // if the current state is invalid, we'll need to issue a request
 	    state = STATE_REQUESTED;
-	    valid_event_impl = GenEventImpl::create_genevent();
-            e = valid_event_impl->current_event();
+	    valid_event = GenEventImpl::create_genevent()->current_event();
 	    issue_request = true;
 	    break;
 	  }
@@ -973,8 +969,7 @@ namespace LegionRuntime {
 	case STATE_REQUESTED:
 	  {
 	    // request has already been issued, but return the event again
-	    assert(valid_event_impl);
-            e = valid_event_impl->current_event();
+	    assert(valid_event.exists());
 	    break;
 	  }
 
@@ -989,7 +984,9 @@ namespace LegionRuntime {
       if(issue_request)
 	MetadataRequestMessage::send_request(owner, id);
 
-      return e;
+      // it's possible that valid_event has been set back to NO_EVENT by the time
+      //  we get here, but that's ok
+      return valid_event;
     }
 
     void MetadataBase::await_data(bool block /*= true*/)
@@ -1004,8 +1001,8 @@ namespace LegionRuntime {
 	AutoHSLLock a(mutex);
 
 	assert(state != STATE_INVALID);
-	if(valid_event_impl)
-          e = valid_event_impl->current_event();
+
+	e = valid_event;
       }
 
       if(!e.has_triggered())
@@ -1368,10 +1365,9 @@ namespace LegionRuntime {
 
     GenEventImpl::GenEventImpl(void)
       : me((IDType)-1), owner(-1)
+      , generation(0), gen_subscribed(0)
+      , next_free(0), poisoned_generations(0), has_local_triggers(false)
     {
-      generation = 0;
-      gen_subscribed = 0;
-      next_free = 0;
     }
 
     void GenEventImpl::init(ID _me, unsigned _init_owner)
@@ -1381,6 +1377,7 @@ namespace LegionRuntime {
       generation = 0;
       gen_subscribed = 0;
       next_free = 0;
+      poisoned_generations = 0;
     }
 
     struct EventSubscribeArgs {
@@ -1399,6 +1396,8 @@ namespace LegionRuntime {
     public:
       gasnet_node_t node;
       Event event;
+      bool poisoned;
+
     public:
       void apply(gasnet_node_t target);
     };
@@ -1413,6 +1412,18 @@ namespace LegionRuntime {
     {
       EventTriggerMessage::request(target, *this);
     }
+
+    // an event update message is like a trigger message, but it can carry a list of poisoned generations
+    struct EventUpdateArgs : public BaseMedium {
+      gasnet_node_t node;
+      Event event;
+    };
+
+    void handle_event_update(EventUpdateArgs args, const void *data, size_t len);
+
+    typedef ActiveMessageMediumNoReply<EVENT_UPDATE_MSGID,
+				       EventUpdateArgs,
+				       handle_event_update> EventUpdateMessage;
 
     static Logger::Category log_event("event");
 
@@ -1472,15 +1483,31 @@ namespace LegionRuntime {
 		    args.node, args.event.id, args.event.gen, impl->generation);
 	}
       }
-    } 
+    }
 
     void handle_event_trigger(EventTriggerArgs args)
     {
       DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
-      log_event.debug("Remote trigger of event " IDFMT "/%d from node %d!",
-		args.event.id, args.event.gen, args.node);
+      log_event.debug("Remote trigger of event " IDFMT "/%d from node %d (poison=%d)!",
+		      args.event.id, args.event.gen, args.node, args.poisoned);
       GenEventImpl *impl = get_runtime()->get_genevent_impl(args.event);
-      impl->trigger(args.event.gen, args.node);
+      impl->perform_trigger(args.node, args.event.gen, args.poisoned);
+    }
+
+    void handle_event_update(EventUpdateArgs args, const void *data, size_t len)
+    {
+      DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
+
+      // number of poisoned events is implicit in the amount of data sent
+      size_t num_poisoned = len / sizeof(Event::gen_t);
+      assert(num_poisoned <= GenEventImpl::POISONED_GENERATION_LIMIT);
+
+      log_event.debug("event update: event=" IDFMT "/%d (poison count=%zd)",
+		      args.event.id, args.event.gen, num_poisoned);
+
+      GenEventImpl *impl = get_runtime()->get_genevent_impl(args.event);
+      impl->handle_remote_update(args.event.gen, num_poisoned, 
+				 static_cast<const Event::gen_t *>(data));
     }
 
     /*static*/ const Event Event::NO_EVENT = { 0, 0 };
@@ -1494,17 +1521,27 @@ namespace LegionRuntime {
 
     bool Event::has_triggered(void) const
     {
+      bool poisoned = false;
+      bool ret = has_triggered_faultaware(poisoned);
+      // caller isn't prepared to handle poison, so propagate failure
+      if(poisoned)
+	Processor::report_execution_fault(Realm::Faults::ERROR_POISONED_EVENT,
+					  this, sizeof(this));
+      return ret;
+    }
+
+    bool Event::has_triggered_faultaware(bool& poisoned) const
+    {
       DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
       if(!id) return true; // special case: NO_EVENT has always triggered
       Event::Impl *e = get_runtime()->get_event_impl(*this);
-      return e->has_triggered(gen);
+      return e->has_triggered(gen, poisoned);
     }
-
 
     // Perform our merging events in a lock free way
     class EventMerger : public EventWaiter {
     public:
-      EventMerger(GenEventImpl *_finish_event)
+      EventMerger(Event _finish_event)
 	: count_needed(1), finish_event(_finish_event)
       {
       }
@@ -1515,7 +1552,10 @@ namespace LegionRuntime {
 
       void add_event(Event wait_for)
       {
-	if(wait_for.has_triggered()) return; // early out
+	// don't check for has_triggered() here because we don't have a plan for what to
+	//  do if the event is poisoned
+	//if(wait_for.has_triggered()) return; // early out
+	
         // Increment the count and then add ourselves
         __sync_fetch_and_add(&count_needed, 1);
 	// step 2: enqueue ourselves on the input event
@@ -1528,42 +1568,66 @@ namespace LegionRuntime {
       //  means the caller should delete this EventMerger)
       bool arm(void)
       {
-	bool nuke = event_triggered();
+	bool nuke = event_triggered(false /*not poisoned*/);
         return nuke;
       }
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
-	// save ID and generation because we can't reference finish_event after the
-	// decrement (unless last_trigger ends up being true)
-	IDType id = finish_event->me.id();
-	Event::gen_t gen = finish_event->generation;
+	// save finish event locally because of race conditions with who deletes this
+	//  object (the last trigger always does, which may not be the same thread that
+	//  propagates the trigger)
+	Event local_finish_event = finish_event;
 
+	// we need to keep track of whether any of the input events contributed poison,
+	//  and do it in a way that's atomic with the decrement of 'count_needed', so we'll
+	//  borrow one of the upper bits (bit 30, to be specific) to mark poisoning
+	// this limits us to only being able to merge 1B input events, but I think we can live
+	//  with that
+	static const int POISON_FLAG = 1 << 30;
+	
+	// update poison flag before decrementing trigger count
+	// the first poisoner can immediately propagate the poison
+	bool first_poisoner;
+	if(poisoned) {
+	  // can't add here - might overflow
+	  int oldval = __sync_fetch_and_or(&count_needed, POISON_FLAG);
+	  first_poisoner = ((oldval & POISON_FLAG) == 0);
+	} else
+	  first_poisoner = false;
+
+	// 'this' is potentially invalid after this line
 	int count_left = __sync_fetch_and_add(&count_needed, -1);
 
         // Put the logging first to avoid segfaults
-        log_event.info("received trigger merged event " IDFMT "/%d (%d)",
-		  id, gen, count_left);
+        log_event.info("received trigger merged event " IDFMT "/%d poison=%d(%d) (%d)",
+		       local_finish_event.id, local_finish_event.gen, poisoned, first_poisoner, count_left);
 
-	// count is the value before the decrement, so it was 1, it's now 0
-	bool last_trigger = (count_left == 1);
+	// two conditions to calculate:
 
-	if(last_trigger) {
-	  finish_event->trigger_current();
+	// 1) trigger finish_event if:
+	//     a) event is not poisoned and we're the last trigger
+	//     b) event IS poisoned and we're the first poisoner
+	bool is_poisoned = ((count_left & POISON_FLAG) != 0);
+	bool last_trigger = ((count_left & ~POISON_FLAG) == 1); // if 1 before dec, is 0 now
+
+	if(is_poisoned ? first_poisoner : last_trigger) {
+	  GenEventImpl::local_trigger(local_finish_event, is_poisoned);
 	}
 
-        // caller can delete us if this was the last trigger
+	// 2) allow caller to delete this EventMerger if this was the last trigger
+	//   (regardless of poison)
         return last_trigger;
       }
 
       virtual void print_info(FILE *f)
       {
-	fprintf(f,"event merger: " IDFMT "/%d\n", finish_event->me.id(), finish_event->generation+1);
+	fprintf(f,"event merger: " IDFMT "/%d\n", finish_event.id, finish_event.gen);
       }
 
     protected:
       int count_needed;
-      GenEventImpl *finish_event;
+      Event finish_event;
     };
 
     // creates an event that won't trigger until all input events have
@@ -1578,11 +1642,18 @@ namespace LegionRuntime {
       Event first_wait;
       for(std::set<Event>::const_iterator it = wait_for.begin();
 	  (it != wait_for.end()) && (wait_count < 2);
-	  it++)
-	if(!(*it).has_triggered()) {
+	  it++) {
+	bool poisoned = false;
+	if((*it).has_triggered_faultaware(poisoned)) {
+	  // if one of the input events is poisoned, we need to propagate the
+	  //  poison - luckily, we have a convenient poisoned Event right here
+	  if(poisoned)
+	    return *it;
+	} else {
 	  if(!wait_count) first_wait = *it;
 	  wait_count++;
 	}
+      }
       log_event.info("merging events - at least %d not triggered",
 		wait_count);
 
@@ -1596,11 +1667,8 @@ namespace LegionRuntime {
         return *(wait_for.begin());
 #endif
       // counts of 2+ require building a new event and a merger to trigger it
-      GenEventImpl *finish_event = GenEventImpl::create_genevent();
+      Event finish_event = GenEventImpl::create_genevent()->current_event();
       EventMerger *m = new EventMerger(finish_event);
-
-      // get the Event for this GenEventImpl before any triggers can occur
-      Event e = finish_event->current_event();
 
 #ifdef EVENT_GRAPH_TRACE
       log_event_graph.info("Event Merge: (" IDFMT ",%d) %ld", 
@@ -1611,7 +1679,7 @@ namespace LegionRuntime {
 	  it != wait_for.end();
 	  it++) {
 	log_event.info("merged event " IDFMT "/%d waiting for " IDFMT "/%d",
-		  finish_event->me.id(), finish_event->generation, (*it).id, (*it).gen);
+		       finish_event.id, finish_event.gen, (*it).id, (*it).gen);
 	m->add_event(*it);
 #ifdef EVENT_GRAPH_TRACE
         log_event_graph.info("Event Precondition: (" IDFMT ",%d) (" IDFMT ",%d)",
@@ -1621,10 +1689,14 @@ namespace LegionRuntime {
       }
 
       // once they're all added - arm the thing (it might go off immediately)
-      if(m->arm())
+      if(m->arm()) {
         delete m;
+	// can't return NO_EVENT here - the finish_event might be poisoned
+	//assert(finish_event.has_triggered());
+	//finish_event = Event::NO_EVENT;
+      }
 
-      return e;
+      return finish_event;
     }
 
     /*static*/ Event GenEventImpl::merge_events(Event ev1, Event ev2,
@@ -1636,12 +1708,22 @@ namespace LegionRuntime {
       //  event we saw for the count==1 case
       int wait_count = 0;
       Event first_wait;
-      if(!ev6.has_triggered()) { first_wait = ev6; wait_count++; }
-      if(!ev5.has_triggered()) { first_wait = ev5; wait_count++; }
-      if(!ev4.has_triggered()) { first_wait = ev4; wait_count++; }
-      if(!ev3.has_triggered()) { first_wait = ev3; wait_count++; }
-      if(!ev2.has_triggered()) { first_wait = ev2; wait_count++; }
-      if(!ev1.has_triggered()) { first_wait = ev1; wait_count++; }
+      // if any of these events are poisoned, return that event immediately to
+      //  propagate the poison
+      bool poisoned;
+#define CHECK_EVENT(e) do {		\
+      if((e).has_triggered_faultaware(poisoned)) { \
+	if(poisoned) return (e); \
+      } else { \
+	first_wait = (e); wait_count++; \
+      } } while(0)
+      CHECK_EVENT(ev6);
+      CHECK_EVENT(ev5);
+      CHECK_EVENT(ev4);
+      CHECK_EVENT(ev3);
+      CHECK_EVENT(ev2);
+      CHECK_EVENT(ev1);
+#undef CHECK_EVENT
 
       // Avoid these optimizations if we are doing event graph tracing
 #ifndef EVENT_GRAPH_TRACE
@@ -1670,11 +1752,8 @@ namespace LegionRuntime {
 #endif
 
       // counts of 2+ require building a new event and a merger to trigger it
-      GenEventImpl *finish_event = GenEventImpl::create_genevent();
+      Event finish_event = GenEventImpl::create_genevent()->current_event();
       EventMerger *m = new EventMerger(finish_event);
-
-      // get the Event for this GenEventImpl before any triggers can occur
-      Event e = finish_event->current_event();
 
       m->add_event(ev1);
       m->add_event(ev2);
@@ -1707,10 +1786,14 @@ namespace LegionRuntime {
 #endif
 
       // once they're all added - arm the thing (it might go off immediately)
-      if(m->arm())
+      if(m->arm()) {
         delete m;
+	// can't return NO_EVENT here - the finish_event might be poisoned
+	//assert(finish_event.has_triggered());
+	//finish_event = Event::NO_EVENT;
+      }
 
-      return e;
+      return finish_event;
     }
 
     // creates an event that won't trigger until all input events have
@@ -1739,11 +1822,36 @@ namespace LegionRuntime {
       return u;
     }
 
+    class DeferredEventTrigger : public EventWaiter {
+    public:
+      DeferredEventTrigger(Event _after_event)
+	: after_event(_after_event)
+      {}
+
+      virtual ~DeferredEventTrigger(void) { }
+
+      virtual bool event_triggered(bool poisoned)
+      {
+	log_event.info("deferred trigger occuring: " IDFMT "/%d poison=%d",
+		       after_event.id, after_event.gen, poisoned);
+	GenEventImpl::local_trigger(after_event, poisoned);
+        return true;
+      }
+
+      virtual void print_info(FILE *f)
+      {
+	fprintf(f,"deferred trigger: after=" IDFMT "/%d\n",
+		after_event.id, after_event.gen);
+      }
+
+    protected:
+      Event after_event;
+    };
+
     void UserEvent::trigger(Event wait_on) const
     {
       DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
 
-      GenEventImpl *e = get_runtime()->get_genevent_impl(*this);
 #ifdef EVENT_GRAPH_TRACE
       Event enclosing = find_enclosing_termination_event();
       log_event_graph.info("Event Trigger: (" IDFMT ",%d) (" IDFMT 
@@ -1751,7 +1859,28 @@ namespace LegionRuntime {
                             id, gen, wait_on.id, wait_on.gen,
                             enclosing.id, enclosing.gen);
 #endif
-      e->trigger(gen, gasnet_mynode(), wait_on);
+      
+      GenEventImpl::deferred_trigger(*this, wait_on);
+    }
+
+    /*static*/ void GenEventImpl::deferred_trigger(Event to_trigger, Event wait_on)
+    {
+      // skip the deferral if we know the event has already triggered
+      if(!wait_on.has_triggered()) {
+    	// deferred trigger
+    	// TODO: forward the deferred trigger to the owning node if it's remote
+    	log_event.info("deferring user event trigger: in=" IDFMT "/%d out=" IDFMT "/%d",
+    		       wait_on.id, wait_on.gen, to_trigger.id, to_trigger.gen);
+    	wait_on.impl()->add_waiter(wait_on.gen, new DeferredEventTrigger(to_trigger));
+    	return;
+      }
+
+      GenEventImpl::local_trigger(to_trigger, false /*not poisoned*/);
+    }
+
+    void UserEvent::cancel(void) const
+    {
+      assert(0 && "fault injection not implemented yet");
     }
 
     /*static*/ GenEventImpl *GenEventImpl::create_genevent(void)
@@ -1772,33 +1901,33 @@ namespace LegionRuntime {
       return impl;
     }
     
-    void GenEventImpl::check_for_catchup(Event::gen_t implied_trigger_gen)
-    {
-      // early out before we take a lock
-      if(implied_trigger_gen <= generation) return;
+    // void GenEventImpl::check_for_catchup(Event::gen_t implied_trigger_gen)
+    // {
+    //   // early out before we take a lock
+    //   if(implied_trigger_gen <= generation) return;
 
-      // now take a lock and see if we really need to catch up
-      std::vector<EventWaiter *> stale_waiters;
-      {
-	AutoHSLLock a(mutex);
+    //   // now take a lock and see if we really need to catch up
+    //   std::vector<EventWaiter *> stale_waiters;
+    //   {
+    // 	AutoHSLLock a(mutex);
 
-	if(implied_trigger_gen > generation) {
-	  assert(owner != gasnet_mynode());  // cannot be a local event
+    // 	if(implied_trigger_gen > generation) {
+    // 	  assert(owner != gasnet_mynode());  // cannot be a local event
 
-	  log_event.info("event catchup: " IDFMT "/%d -> %d",
-			 me.id(), generation, implied_trigger_gen);
-	  generation = implied_trigger_gen;
-	  stale_waiters.swap(local_waiters);  // we'll actually notify them below
-	}
-      }
+    // 	  log_event.info("event catchup: " IDFMT "/%d -> %d",
+    // 			 me.id(), generation, implied_trigger_gen);
+    // 	  generation = implied_trigger_gen;
+    // 	  stale_waiters.swap(local_waiters);  // we'll actually notify them below
+    // 	}
+    //   }
 
-      if(!stale_waiters.empty()) {
-	for(std::vector<EventWaiter *>::iterator it = stale_waiters.begin();
-	    it != stale_waiters.end();
-	    it++)
-	  (*it)->event_triggered();
-      }
-    }
+    //   if(!stale_waiters.empty()) {
+    // 	for(std::vector<EventWaiter *>::iterator it = stale_waiters.begin();
+    // 	    it != stale_waiters.end();
+    // 	    it++)
+    // 	  (*it)->event_triggered();
+    //   }
+    // }
 
     bool GenEventImpl::add_waiter(Event::gen_t needed_gen, EventWaiter *waiter)
     {
@@ -1811,46 +1940,52 @@ namespace LegionRuntime {
       }
 #endif
       bool trigger_now = false;
-
-      int subscribe_owner = -1;
-      EventSubscribeArgs args;
-      // initialization to make not-as-clever compilers happy
-      args.node = 0;
-      args.event = Event::NO_EVENT;
-      args.previous_subscribe_gen = 0;
+      bool poisoned = false;
+      Event::gen_t subscribe_gen = 0;
       {
 	AutoHSLLock a(mutex);
 
-	if(needed_gen > generation) {
-	  log_event.debug("event not ready: event=" IDFMT "/%d owner=%d gen=%d subscr=%d",
-		    me.id(), needed_gen, owner, generation, gen_subscribed);
+	// three cases to check:
 
-	  // catchup code for remote events has been moved to get_genevent_impl, so
-	  //  we should never be asking for a stale version here
-	  assert(needed_gen == (generation + 1));
-
-	  // do we need to subscribe?
-	  if((owner != gasnet_mynode()) && (gen_subscribed < needed_gen)) {
-	    gen_subscribed = needed_gen;
-	    subscribe_owner = owner;
-	    args.node = gasnet_mynode();
-	    args.event = me.convert<Event>();
-	    args.event.gen = needed_gen;
-	  }
-
-	  // now we add to the local waiter list
-	  local_waiters.push_back(waiter);
+	// 1. event has already occurred - we'll trigger immediately, but check to see if it's
+	//  poisoned
+	if(needed_gen <= generation) {
+	  trigger_now = true;
+	  if(poisoned_generations)
+	    poisoned = poisoned_generations->count(needed_gen);
 	} else {
-	  // event we are interested in has already triggered!
-	  trigger_now = true; // actually do trigger outside of mutex
+	  // 2. is this something we triggered locally, even if we don't know about some in between
+	  std::map<Event::gen_t, bool>::iterator it = local_triggers.find(needed_gen);
+	  if(it != local_triggers.end()) {
+	    // yes, again trigger immediately
+	    trigger_now = true;
+	    poisoned = it->second;
+	  } else {
+	    // 3. as far as we know, the event hasn't triggered - add it to the list of local waiters
+	    local_waiters[needed_gen].push_back(waiter);
+
+	    // if we're not the owner, we might also need to subscribe to this event
+	    //  need to subscribe to it
+	    if((owner != gasnet_mynode()) && (gen_subscribed < needed_gen)) {
+	      subscribe_gen = needed_gen;
+	      gen_subscribed = needed_gen;
+	    }
+	  }
 	}
       }
 
-      if((subscribe_owner != -1))
+      // send a subscription if it was needed
+      if(subscribe_gen) {
+	EventSubscribeArgs args;
+	args.event = me.convert<Event>();
+	args.event.gen = subscribe_gen;
+	args.node = gasnet_mynode();
 	EventSubscribeMessage::request(owner, args);
+      }
 
+      // trigger if we didn't put the waiter on the local list
       if(trigger_now) {
-	bool nuke = waiter->event_triggered();
+	bool nuke = waiter->event_triggered(poisoned);
         if(nuke)
           delete waiter;
       }
@@ -1858,7 +1993,7 @@ namespace LegionRuntime {
       return true;  // waiter is always either enqueued or triggered right now
     }
 
-    bool GenEventImpl::has_triggered(Event::gen_t needed_gen)
+    bool GenEventImpl::has_triggered(Event::gen_t needed_gen, bool& poisoned)
     {
 #ifdef EVENT_TRACING
       {
@@ -1868,21 +2003,48 @@ namespace LegionRuntime {
         item.action = EventTraceItem::ACT_QUERY;
       }
 #endif
-      return (needed_gen <= generation);
+
+      // check global generation count - no lock needed
+      if(needed_gen <= generation) {
+	// ok, but still need to check for poison
+	if(poisoned_generations) {
+	  AutoHSLLock a(mutex); // hold lock to look inside set
+	  poisoned = (poisoned_generations->count(needed_gen) > 0);
+	} else
+	  poisoned = false; // no lock needed here
+	return true;
+      }
+
+      // check local triggers
+      if(has_local_triggers) {
+	AutoHSLLock a(mutex);
+
+	std::map<Event::gen_t, bool>::iterator it = local_triggers.find(needed_gen);
+	if(it != local_triggers.end()) {
+	  poisoned = it->second;
+	  return true;
+	}
+      }
+
+      // doesn't look like it's been triggered yet
+      poisoned = false;
+      return false;
     }
 
     class PthreadCondWaiter : public EventWaiter {
     public:
       PthreadCondWaiter(GASNetCondVar &_cv)
-        : cv(_cv)
+        : cv(_cv), was_poisoned(false)
       {
       }
       virtual ~PthreadCondWaiter(void) 
       {
       }
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	was_poisoned = poisoned;
+	
         // Need to hold the lock to avoid the race
         AutoHSLLock(cv.mutex);
 	cv.signal();
@@ -1893,70 +2055,155 @@ namespace LegionRuntime {
 
     public:
       GASNetCondVar &cv;
+      bool was_poisoned;
     };
 
-    void GenEventImpl::external_wait(Event::gen_t gen_needed)
+    void GenEventImpl::external_wait(Event::gen_t gen_needed, bool& poisoned)
     {
+      // early out only works if the global generation is past what we need
+      //  AND there are no poisoned generations
+      if((gen_needed <= generation) && !poisoned_generations) {
+	poisoned = false;
+	return;
+      }
+
       GASNetCondVar cv(mutex);
       PthreadCondWaiter w(cv);
+      while(1) {
+	AutoHSLLock a(mutex);
+
+	// two ways to succeed
+
+	// 1. global generation is past where we need
+	if(gen_needed <= generation) {
+	  poisoned = (poisoned_generations &&
+		      poisoned_generations->count(gen_needed));
+	  assert(!poisoned);
+	  return;
+	}
+
+	// 2. local triggers have covered the generation we need
+	if(has_local_triggers) {
+	  std::map<Event::gen_t, bool>::const_iterator it = local_triggers.find(gen_needed);
+	  if(it != local_triggers.end()) {
+	    poisoned = it->second;
+	    assert(!poisoned);
+	    return;
+	  }
+	}
+
+	// oh well..  we're going to have to wait
+	local_waiters[gen_needed].push_back(&w);
+
+	// and if a subscriptions necessary, we're SOL
+	bool subscription_needed = ((owner != gasnet_mynode()) && (gen_needed > gen_subscribed));
+	if(subscription_needed) {
+	  printf("AAAH!  Can't subscribe to another node's event in external_wait()!\n");
+	  exit(1);
+	}
+
+	// now just sleep on the condition variable - hope we wake up
+	cv.wait();
+
+	// we don't have a way to propagate poison
+	assert(!w.was_poisoned);
+      }
+    }
+
+    // record that the event has triggered and notify anybody who cares
+    void GenEventImpl::local_trigger(Event::gen_t gen_triggered, bool poisoned)
+    {
+      // if we're the owner, the full triggering is performed here
+      if(owner == gasnet_mynode()) {
+	perform_trigger(gasnet_mynode(), gen_triggered, poisoned);
+	return;
+      }
+
+      log_event.spew("event triggered: event=" IDFMT "/%d by node %d", 
+		     me.id(), gen_triggered, gasnet_mynode());
+#ifdef EVENT_TRACING
+      {
+        EventTraceItem &item = Tracer<EventTraceItem>::trace_item();
+        item.event_id = me.id;
+        item.event_gen = gen_triggered;
+        item.action = EventTraceItem::ACT_TRIGGER;
+      }
+#endif
+
+      // if we're not the owner, we'll have to forward the triggering request, but
+      //  we must also wake up anybody that's locally waiting on this generation
+      //  (we will not receive an update from the owner)
+
+      std::vector<EventWaiter *> to_wake;
       {
 	AutoHSLLock a(mutex);
 
-	if(gen_needed > generation) {
-	  local_waiters.push_back(&w);
-    
-	  if((owner != gasnet_mynode()) && (gen_needed > gen_subscribed)) {
-	    printf("AAAH!  Can't subscribe to another node's event in external_wait()!\n");
-	    exit(1);
-	  }
+	// marking poisoned generations must be done before the global
+	//  generation count is bumped
+	if(poisoned) {
+	  if(!poisoned_generations)
+	    poisoned_generations = new std::set<Event::gen_t>;
+	  poisoned_generations->insert(gen_triggered);
+	}
 
-	  // now just sleep on the condition variable - hope we wake up
-	  cv.wait();
+	// remember that this was locally triggered (or update the current generation
+	//  in the special case of this being exactly the next one expected)
+	if(gen_triggered == (generation + 1)) {
+	  generation = gen_triggered;
+	} else {
+	  local_triggers[gen_triggered] = poisoned;
+	  has_local_triggers = true;
+	}
+
+	// extract the local waiter list
+	std::map<Event::gen_t, std::vector<EventWaiter *> >::iterator it = local_waiters.find(gen_triggered);
+	if(it != local_waiters.end()) {
+	  to_wake.swap(it->second);
+	  local_waiters.erase(it);
 	}
       }
+
+      // send the trigger message to the owner
+      {
+	EventTriggerArgs args;
+	args.node = gasnet_mynode();
+	args.event = me.convert<Event>();
+	args.event.gen = gen_triggered;
+	args.poisoned = poisoned;
+	EventTriggerMessage::request(owner, args);
+      }
+
+      // now do local wakeups
+      for(std::vector<EventWaiter *>::iterator it = to_wake.begin();
+	  it != to_wake.end();
+	  it++) {
+	bool nuke = (*it)->event_triggered(poisoned);
+	if(nuke)
+	  delete (*it);
+      }
     }
 
-    class DeferredEventTrigger : public EventWaiter {
-    public:
-      DeferredEventTrigger(GenEventImpl *_after_event)
-	: after_event(_after_event)
-      {}
-
-      virtual ~DeferredEventTrigger(void) { }
-
-      virtual bool event_triggered(void)
-      {
-	log_event.info("deferred trigger occuring: " IDFMT "/%d", after_event->me.id(), after_event->generation+1);
-	after_event->trigger_current();
-        return true;
-      }
-
-      virtual void print_info(FILE *f)
-      {
-	fprintf(f,"deferred trigger: after=" IDFMT "/%d\n",
-		after_event->me.id(), after_event->generation+1);
-      }
-
-    protected:
-      GenEventImpl *after_event;
-    };
-
-    void GenEventImpl::trigger_current(void)
+    /*static*/ void GenEventImpl::local_trigger(Event event_triggered, bool poisoned)
     {
-      // wrapper triggers the next generation on the current node
-      trigger(generation + 1, gasnet_mynode());
+      GenEventImpl *impl = get_runtime()->get_genevent_impl(event_triggered);
+      impl->local_trigger(event_triggered.gen, poisoned);
     }
 
-    void GenEventImpl::trigger(Event::gen_t gen_triggered, int trigger_node, Event wait_on)
+    // void GenEventImpl::trigger(Event::gen_t gen_triggered, int trigger_node, Event wait_on)
+    // {
+    //   if(!wait_on.has_triggered()) {
+    // 	// deferred trigger
+    // 	// TODO: forward the deferred trigger to the owning node if it's remote
+    // 	log_event.info("deferring event trigger: in=" IDFMT "/%d out=" IDFMT "/%d",
+    // 		       wait_on.id, wait_on.gen, me.id(), gen_triggered);
+    // 	wait_on.impl()->add_waiter(wait_on.gen, new DeferredEventTrigger(this));
+    // 	return;
+    //   }
+
+    void GenEventImpl::perform_trigger(int trigger_node, Event::gen_t gen_triggered, bool poisoned)
     {
-      if(!wait_on.has_triggered()) {
-	// deferred trigger
-	// TODO: forward the deferred trigger to the owning node if it's remote
-	log_event.info("deferring event trigger: in=" IDFMT "/%d out=" IDFMT "/%d",
-		       wait_on.id, wait_on.gen, me.id(), gen_triggered);
-	wait_on.impl()->add_waiter(wait_on.gen, new DeferredEventTrigger(this));
-	return;
-      }
+      // sanity check - this can only be run by the owning node
+      assert(owner == gasnet_mynode());
 
       log_event.spew("event triggered: event=" IDFMT "/%d by node %d", 
 		me.id(), gen_triggered, trigger_node);
@@ -1970,78 +2217,187 @@ namespace LegionRuntime {
 #endif
 
       std::vector<EventWaiter *> to_wake;
+      NodeSet remote_notifications;
+      bool return_to_freelist = true;
       {
 	AutoHSLLock a(mutex);
 
-        // SJT: there is at least one unavoidable case where we'll receive
-	//  duplicate trigger notifications, so if we see a triggering of
-	//  an older generation, just ignore it
-	if(gen_triggered <= generation) return;
+	// duplicate triggers are a problem with respect to poisoning
+	// so try to hold the line on never getting a duplicate here
+	assert(gen_triggered == (generation + 1));
 
-	// in preparation for switching everybody over to trigger_current(), complain
-	//  LOUDLY if this wouldn't actually be a triggering of the current generation
-	if(gen_triggered != (generation + 1))
-	  log_event.error("HELP!  non-current event generation being triggered: " IDFMT "/%d vs %d",
-			  me.id(), gen_triggered, generation + 1);
+	// was this generation poisoned?
+	// NOTE: this update must be performed before the generation count is
+	//  updated!
+	if(poisoned) {
+	  if(!poisoned_generations)
+	    poisoned_generations = new std::set<Event::gen_t>;
+	  poisoned_generations->insert(gen_triggered);
+
+	  // if we've exceeded the limit of poisoned generations, don't reuse this
+	  //  generational event
+	  if(poisoned_generations->size() >= POISONED_GENERATION_LIMIT)
+	    return_to_freelist = false;
+	}
 
         generation = gen_triggered;
 
-	// grab whole list of local waiters - we'll trigger them once we let go of the lock
-	//printf("[%d] LOCAL WAITERS: %zd\n", gasnet_mynode(), local_waiters.size());
-	to_wake.swap(local_waiters);
+	// extract the local waiter list - it had better be the first one, if it's there at all
+	std::map<Event::gen_t, std::vector<EventWaiter *> >::iterator it = local_waiters.begin();
+	if(it != local_waiters.end()) {
+	  assert(it->first >= gen_triggered);
 
-	// notify remote waiters and/or event's actual owner
-	if(owner == gasnet_mynode()) {
-	  // send notifications to every other node that has subscribed
-	  //  (except the one that triggered)
-          if (!remote_waiters.empty())
-          {
-            EventTriggerArgs args;
-            args.node = trigger_node;
-            args.event = me.convert<Event>();
-            args.event.gen = gen_triggered;
+	  if(it->first == gen_triggered) {
+	    to_wake.swap(it->second);
+	    local_waiters.erase(it);
+	  }
+	}
 
-            NodeSet send_mask;
-            send_mask.swap(remote_waiters);
-            send_mask.map(args);
-            //for(int node = 0; node < MAX_NUM_NODES; node++)
-            //  if (send_mask.contains(node) && (node != trigger_node))
-            //    EventTriggerMessage::request(node, args);
-          }
+	// notify any remote waiters, minus the one that did the triggering
+	remote_notifications = remote_waiters;
+	remote_notifications.remove(trigger_node);
+	remote_waiters.clear();
+      }
+
+      // do any remote notifications
+      if(!!remote_notifications) {
+	EventUpdateArgs args;
+	args.event = me.convert<Event>();
+	args.event.gen = generation;
+
+	// do we have any poisoned generations to send in the update?
+	if(poisoned_generations) {
+	  // putting them into a vector is an easy way to serialize them
+	  std::vector<Event::gen_t> gen_list(poisoned_generations->begin(),
+					     poisoned_generations->end());
+
+	  // TODO - use apply() helper
+          for(int node = 0; node < MAX_NUM_NODES; node++)
+            if(remote_notifications.contains(node))
+              EventUpdateMessage::request(node, args, 
+					  &gen_list[0],
+					  gen_list.size() * sizeof(Event::gen_t),
+					  PAYLOAD_COPY);
 	} else {
-	  if(((unsigned)trigger_node) == gasnet_mynode()) {
-	    // if we're not the owner, we just send to the owner and let him
-	    //  do the broadcast (assuming the trigger was local)
-	    //assert(remote_waiters == 0);
+          for(int node = 0; node < MAX_NUM_NODES; node++)
+            if(remote_notifications.contains(node))
+              EventUpdateMessage::request(node, args, 0, 0, PAYLOAD_COPY);
+	}
+      }
 
-	    EventTriggerArgs args;
-	    args.node = trigger_node;
-	    args.event = me.convert<Event>();
-	    args.event.gen = gen_triggered;
-	    EventTriggerMessage::request(owner, args);
+      // wake the local waiters
+      for(std::vector<EventWaiter *>::iterator it = to_wake.begin();
+	  it != to_wake.end();
+	  it++) {
+	bool nuke = (*it)->event_triggered(poisoned);
+	if(nuke)
+	  delete (*it);
+      }
+
+      // put this back on the free list (unless it's got too many
+      //  poisoned generations)
+      if(return_to_freelist)
+	get_runtime()->local_event_free_list->free_entry(this);
+    }
+
+    void GenEventImpl::handle_remote_update(Event::gen_t new_generation,
+					    size_t num_poisoned,
+					    const Event::gen_t *poison_data)
+    {
+      // early out - have we already heard about this update?
+      if(new_generation <= generation)
+	return;
+
+      // this update might allow us to signal waiters on multiple generations,
+      //  some of which might be poisoned
+      std::list<std::vector<EventWaiter *> > to_trigger, to_poison;
+
+      {
+	AutoHSLLock a(mutex);
+
+	// first, update our data based on what we've received, and don't
+	//  get confused by out-of-order messages
+	if(new_generation > generation) {
+	  generation = new_generation;
+	  
+	  // bonus points - have we triggered the next generation?
+	  // if so, count that one too since our message to the owner is in flight
+	  if(local_triggers.count(generation + 1) > 0)
+	    generation++;
+	}
+
+	// it'd be nice to sanity-check here that our current data is a subset of
+	//  what we've received, but that might not actually be true if we receive
+	//  delayed or out-of-order data
+	if(num_poisoned) {
+	  if(!poisoned_generations)
+	    poisoned_generations = new std::set<Event::gen_t>;
+	  for(size_t i = 0; i < num_poisoned; i++)
+	    poisoned_generations->insert(poison_data[i]);
+	}
+
+	// clean out any local triggers we were remembering
+	{
+	  std::map<Event::gen_t, bool>::iterator it = local_triggers.begin();
+	  while((it != local_triggers.end()) && (it->first <= generation)) {
+	    {
+	      // sanity-check - poisoning needs to match here
+	      bool our_poisoned = it->second;
+	      bool their_poisoned = (poisoned_generations &&
+				     (poisoned_generations->count(it->first) > 0));
+	      assert(our_poisoned == their_poisoned);
+	    }
+	    local_triggers.erase(it);
+	    it = local_triggers.begin();
+	  }
+	  has_local_triggers = !local_triggers.empty();
+	}
+
+	// now get list(s) of waiters to poke
+	{
+	  std::map<Event::gen_t, std::vector<EventWaiter *> >::iterator it = local_waiters.begin();
+	  while((it != local_waiters.end()) && (it->first <= generation)) {
+	    // pick bucket based on poisoning
+	    bool is_poisoned = (poisoned_generations &&
+				(poisoned_generations->count(it->first) > 0));
+	    if(is_poisoned) {
+	      to_poison.push_back(std::vector<EventWaiter *>());
+	      to_poison.back().swap(it->second);
+	    } else {
+	      to_trigger.push_back(std::vector<EventWaiter *>());
+	      to_trigger.back().swap(it->second);
+	    }
+
+	    assert(it->second.empty());
+	    local_waiters.erase(it);
+	    it = local_waiters.begin();
 	  }
 	}
       }
 
-      // if this is one of our events, put ourselves on the free
-      //  list (we don't need our lock for this)
-      if(owner == gasnet_mynode()) {
-	get_runtime()->local_event_free_list->free_entry(this);
-      }
+      // valid triggers first
+      for(std::list<std::vector<EventWaiter *> >::const_iterator it = to_trigger.begin();
+	  it != to_trigger.end();
+	  it++)
+	for(std::vector<EventWaiter *>::const_iterator it2 = (*it).begin();
+	    it2 != (*it).end();
+	    it2++) {
+	  bool nuke = (*it2)->event_triggered(false /*not poisoned*/);
+	  if(nuke)
+	    delete (*it2);
+	}
 
-      // now that we've let go of the lock, notify all the waiters who wanted
-      //  this event generation (or an older one)
-      {
-	for(std::vector<EventWaiter *>::iterator it = to_wake.begin();
-	    it != to_wake.end();
-	    it++) {
-	  bool nuke = (*it)->event_triggered();
-          if(nuke) {
-            //printf("deleting: "); (*it)->print_info(); fflush(stdout);
-            delete (*it);
-          }
-        }
-      }
+      // now poisoned generations
+      for(std::list<std::vector<EventWaiter *> >::const_iterator it = to_poison.begin();
+	  it != to_poison.end();
+	  it++)
+	for(std::vector<EventWaiter *>::const_iterator it2 = (*it).begin();
+	    it2 != (*it).end();
+	    it2++) {
+	  bool nuke = (*it2)->event_triggered(true /*poisoned!*/);
+	  if(nuke)
+	    delete (*it2);
+	}
     }
 
     static Logger::Category log_barrier("barrier");
@@ -2236,8 +2592,9 @@ namespace LegionRuntime {
 	  free(data);
       }
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	assert(!poisoned); // TODO: make poisoned barriers less fatal
 	log_barrier.info("deferred barrier arrival: " IDFMT "/%d (%llx), delta=%d",
 			 barrier.id, barrier.gen, barrier.timestamp, delta);
 	BarrierImpl *impl = get_runtime()->get_barrier_impl(barrier);
@@ -2504,7 +2861,7 @@ namespace LegionRuntime {
 	for(std::vector<EventWaiter *>::const_iterator it = local_notifications.begin();
 	    it != local_notifications.end();
 	    it++) {
-	  bool nuke = (*it)->event_triggered();
+	  bool nuke = (*it)->event_triggered(false /*not poisoned*/);
 	  if(nuke)
 	    delete (*it);
 	}
@@ -2531,8 +2888,10 @@ namespace LegionRuntime {
 	free(final_values_copy);
     }
 
-    bool BarrierImpl::has_triggered(Event::gen_t needed_gen)
+    bool BarrierImpl::has_triggered(Event::gen_t needed_gen, bool& poisoned)
     {
+      poisoned = false; // TODO: add poison to barriers
+
       // no need to take lock to check current generation
       if(needed_gen <= generation) return true;
 
@@ -2557,8 +2916,9 @@ namespace LegionRuntime {
       return false;
     }
 
-    void BarrierImpl::external_wait(Event::gen_t needed_gen)
+    void BarrierImpl::external_wait(Event::gen_t needed_gen, bool& poisoned)
     {
+      poisoned = false; // TODO: add poison to barriers
       assert(0);
     }
 
@@ -2590,7 +2950,7 @@ namespace LegionRuntime {
       }
 
       if(trigger_now) {
-	bool nuke = waiter->event_triggered();
+	bool nuke = waiter->event_triggered(false /*not poisoned*/);
 	if(nuke)
 	  delete waiter;
       }
@@ -2753,118 +3113,10 @@ namespace LegionRuntime {
       for(std::vector<EventWaiter *>::const_iterator it = local_notifications.begin();
 	  it != local_notifications.end();
 	  it++) {
-	bool nuke = (*it)->event_triggered();
+	bool nuke = (*it)->event_triggered(false /*not poisoned*/);
 	if(nuke)
 	  delete (*it);
       }
-    }
-
-    void show_event_waiters(FILE *f = stdout)
-    {
-      fprintf(f,"PRINTING ALL PENDING EVENTS:\n");
-      for(unsigned i = 0; i < gasnet_nodes(); i++) {
-	Node *n = &get_runtime()->nodes[i];
-        // Iterate over all the events and get their implementations
-        for (unsigned long j = 0; j < n->events.max_entries(); j++) {
-          if (!n->events.has_entry(j))
-            continue;
-	  GenEventImpl *e = n->events.lookup_entry(j, i/*node*/);
-	  AutoHSLLock a2(e->mutex);
-
-	  // print anything with either local or remote waiters
-	  if(e->local_waiters.empty() && e->remote_waiters.empty())
-	    continue;
-
-          fprintf(f,"Event " IDFMT ": gen=%d subscr=%d local=%zd remote=%zd\n",
-		  e->me.id(), e->generation, e->gen_subscribed, 
-		  e->local_waiters.size(),
-                  e->remote_waiters.size());
-	  for(std::vector<EventWaiter *>::iterator it = e->local_waiters.begin();
-	      it != e->local_waiters.end();
-	      it++) {
-	      fprintf(f, "  [%d] L:%p ", e->generation + 1, *it);
-	      (*it)->print_info(f);
-	  }
-	  // for(std::map<Event::gen_t, NodeMask>::const_iterator it = e->remote_waiters.begin();
-	  //     it != e->remote_waiters.end();
-	  //     it++) {
-	  //   fprintf(f, "  [%d] R:", it->first);
-	  //   for(int k = 0; k < MAX_NUM_NODES; k++)
-	  //     if(it->second.is_set(k))
-	  // 	fprintf(f, " %d", k);
-	  //   fprintf(f, "\n");
-	  // }
-	}
-        for (unsigned long j = 0; j < n->barriers.max_entries(); j++) {
-          if (!n->barriers.has_entry(j))
-            continue;
-          BarrierImpl *b = n->barriers.lookup_entry(j, i/*node*/); 
-          AutoHSLLock a2(b->mutex);
-          // skip any barriers with no waiters
-          if (b->generations.empty())
-            continue;
-
-          fprintf(f,"Barrier " IDFMT ": gen=%d subscr=%d\n",
-                  b->me.id(), b->generation, b->gen_subscribed);
-          for (std::map<Event::gen_t, BarrierImpl::Generation*>::const_iterator git = 
-                b->generations.begin(); git != b->generations.end(); git++)
-          {
-            const std::vector<EventWaiter*> &waiters = git->second->local_waiters;
-            for (std::vector<EventWaiter*>::const_iterator it = 
-                  waiters.begin(); it != waiters.end(); it++)
-            {
-              fprintf(f, "  [%d] L:%p ", git->first, *it);
-              (*it)->print_info(f);
-            }
-          }
-        }
-      }
-
-      // TODO - pending barriers
-#if 0
-      // // convert from events to barriers
-      // fprintf(f,"PRINTING ALL PENDING EVENTS:\n");
-      // for(int i = 0; i < gasnet_nodes(); i++) {
-      // 	Node *n = &get_runtime()->nodes[i];
-      //   // Iterate over all the events and get their implementations
-      //   for (unsigned long j = 0; j < n->events.max_entries(); j++) {
-      //     if (!n->events.has_entry(j))
-      //       continue;
-      // 	  Event::Impl *e = n->events.lookup_entry(j, i/*node*/);
-      // 	  AutoHSLLock a2(e->mutex);
-
-      // 	  // print anything with either local or remote waiters
-      // 	  if(e->local_waiters.empty() && e->remote_waiters.empty())
-      // 	    continue;
-
-      //     fprintf(f,"Event " IDFMT ": gen=%d subscr=%d local=%zd remote=%zd\n",
-      // 		  e->me.id, e->generation, e->gen_subscribed, 
-      // 		  e->local_waiters.size(), e->remote_waiters.size());
-      // 	  for(std::map<Event::gen_t, std::vector<EventWaiter *> >::iterator it = e->local_waiters.begin();
-      // 	      it != e->local_waiters.end();
-      // 	      it++) {
-      // 	    for(std::vector<EventWaiter *>::iterator it2 = it->second.begin();
-      // 		it2 != it->second.end();
-      // 		it2++) {
-      // 	      fprintf(f, "  [%d] L:%p ", it->first, *it2);
-      // 	      (*it2)->print_info(f);
-      // 	    }
-      // 	  }
-      // 	  for(std::map<Event::gen_t, NodeMask>::const_iterator it = e->remote_waiters.begin();
-      // 	      it != e->remote_waiters.end();
-      // 	      it++) {
-      // 	    fprintf(f, "  [%d] R:", it->first);
-      // 	    for(int k = 0; k < MAX_NUM_NODES; k++)
-      // 	      if(it->second.is_set(k))
-      // 		fprintf(f, " %d", k);
-      // 	    fprintf(f, "\n");
-      // 	  }
-      // 	}
-      // }
-#endif
-
-      fprintf(f,"DONE\n");
-      fflush(f);
     }
 
     ///////////////////////////////////////////////////
@@ -3129,7 +3381,7 @@ namespace LegionRuntime {
       log_reservation.debug(          "reservation request granted: reservation=" IDFMT " mode=%d", // mask=%lx",
 	       args.lock.id, args.mode); //, args.remote_waiter_mask);
 
-      std::deque<GenEventImpl *> to_wake;
+      std::deque<Event> to_wake;
 
       Reservation::Impl *impl = args.lock.impl();
       {
@@ -3161,24 +3413,22 @@ namespace LegionRuntime {
 	assert(any_local);
       }
 
-      for(std::deque<GenEventImpl *>::iterator it = to_wake.begin();
+      for(std::deque<Event>::iterator it = to_wake.begin();
 	  it != to_wake.end();
 	  it++) {
 	log_reservation.debug("release trigger: reservation=" IDFMT " event=" IDFMT "/%d",
-			args.lock.id, (*it)->me.id(), (*it)->generation+1);
-	(*it)->trigger_current();
+			      args.lock.id, (*it).id, (*it).gen);
+	GenEventImpl::local_trigger(*it, false /*not poisoned*/);
       }
     }
 
     Event Reservation::Impl::acquire(unsigned new_mode, bool exclusive,
-				     GenEventImpl *after_lock /* = 0*/)
+				     Event after_lock /*= Event::NO_EVENT*/)
     {
-      Event after_lock_event = after_lock ? after_lock->current_event() : Event::NO_EVENT;
-
-      log_reservation.debug(		      "local reservation request: reservation=" IDFMT " mode=%d excl=%d event=" IDFMT "/%d count=%d impl=%p",
-		      me.id, new_mode, exclusive, 
-		      after_lock_event.id,
-		      after_lock_event.gen, count, this);
+      log_reservation.debug("local reservation request: reservation=" IDFMT " mode=%d excl=%d event=" IDFMT "/%d count=%d impl=%p",
+			    me.id, new_mode, exclusive, 
+			    after_lock.id,
+			    after_lock.gen, count, this);
 
       // collapse exclusivity into mode
       if(exclusive) new_mode = MODE_EXCL;
@@ -3261,10 +3511,9 @@ namespace LegionRuntime {
 	// if we didn't get the lock, put our event on the queue of local
 	//  waiters - create an event if we weren't given one to use
 	if(!got_lock) {
-	  if(!after_lock) {
-	    after_lock = GenEventImpl::create_genevent();
-	    after_lock_event = after_lock->current_event();
-	  }
+	  if(!after_lock.exists())
+	    after_lock = GenEventImpl::create_genevent()->current_event();
+
 	  local_waiters[new_mode].push_back(after_lock);
 	}
       }
@@ -3283,16 +3532,16 @@ namespace LegionRuntime {
       }
 
       // if we got the lock, trigger an event if we were given one
-      if(got_lock && after_lock) 
-	after_lock->trigger(after_lock_event.gen, gasnet_mynode());
+      if(got_lock && after_lock.exists()) 
+	GenEventImpl::local_trigger(after_lock, false /*not poisoned*/);
 
-      return after_lock_event;
+      return after_lock;
     }
 
     // factored-out code to select one or more local waiters on a lock
     //  fills events to trigger into 'to_wake' and returns true if any were
     //  found - NOTE: ASSUMES LOCK IS ALREADY HELD!
-    bool Reservation::Impl::select_local_waiters(std::deque<GenEventImpl *>& to_wake)
+    bool Reservation::Impl::select_local_waiters(std::deque<Event>& to_wake)
     {
       if(local_waiters.size() == 0)
 	return false;
@@ -3305,7 +3554,7 @@ namespace LegionRuntime {
 	
       // further favor exclusive waiters
       if(local_waiters.find(MODE_EXCL) != local_waiters.end()) {
-	std::deque<GenEventImpl *>& excl_waiters = local_waiters[MODE_EXCL];
+	std::deque<Event>& excl_waiters = local_waiters[MODE_EXCL];
 	to_wake.push_back(excl_waiters.front());
 	excl_waiters.pop_front();
 	  
@@ -3318,7 +3567,7 @@ namespace LegionRuntime {
 	log_reservation.spew("count <-1 [%p]=%d", &count, count);
       } else {
 	// pull a whole list of waiters that want to share with the same mode
-	std::map<unsigned, std::deque<GenEventImpl *> >::iterator it = local_waiters.begin();
+	std::map<unsigned, std::deque<Event> >::iterator it = local_waiters.begin();
 	
 	mode = it->first;
 	count = ZERO_COUNT + it->second.size();
@@ -3345,7 +3594,7 @@ namespace LegionRuntime {
     {
       // make a list of events that we be woken - can't do it while holding the
       //  lock's mutex (because the event we trigger might try to take the lock)
-      std::deque<GenEventImpl *> to_wake;
+      std::deque<Event> to_wake;
 
       int release_target = -1;
       LockReleaseArgs r_args;
@@ -3452,12 +3701,12 @@ namespace LegionRuntime {
 #endif
       }
 
-      for(std::deque<GenEventImpl *>::iterator it = to_wake.begin();
+      for(std::deque<Event>::iterator it = to_wake.begin();
 	  it != to_wake.end();
 	  it++) {
 	log_reservation.debug("release trigger: reservation=" IDFMT " event=" IDFMT "/%d",
-			me.id, (*it)->me.id(), (*it)->generation + 1);
-	(*it)->trigger_current();
+			      me.id, (*it).id, (*it).gen);
+	GenEventImpl::local_trigger(*it, false /*not poisoned*/);
       }
     }
 
@@ -3484,13 +3733,22 @@ namespace LegionRuntime {
     class DeferredLockRequest : public EventWaiter {
     public:
       DeferredLockRequest(Reservation _lock, unsigned _mode, bool _exclusive,
-			  GenEventImpl *_after_lock)
+			  Event _after_lock)
 	: lock(_lock), mode(_mode), exclusive(_exclusive), after_lock(_after_lock) {}
 
       virtual ~DeferredLockRequest(void) { }
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	// poisoned lock acquisition isn't too bad - just don't acquire the lock
+	//  and propagate the poison to the after_lock event
+	if(poisoned) {
+	  log_reservation.info("poisoned lock request: reservation=" IDFMT " after=" IDFMT "/%d",
+			       lock.id, after_lock.id, after_lock.gen);
+	  GenEventImpl::local_trigger(after_lock, true /*poisoned!*/);
+	  return true;
+	}
+	
 	lock.impl()->acquire(mode, exclusive, after_lock);
         return true;
       }
@@ -3498,14 +3756,14 @@ namespace LegionRuntime {
       virtual void print_info(FILE *f)
       {
 	fprintf(f,"deferred lock: lock=" IDFMT " after=" IDFMT "/%d\n",
-		lock.id, after_lock->me.id(), after_lock->generation + 1);
+		lock.id, after_lock.id, after_lock.gen);
       }
 
     protected:
       Reservation lock;
       unsigned mode;
       bool exclusive;
-      GenEventImpl *after_lock;
+      Event after_lock;
     };
 
     Event Reservation::acquire(unsigned mode /* = 0 */, bool exclusive /* = true */,
@@ -3521,11 +3779,10 @@ namespace LegionRuntime {
 	return e;
       } else {
 	Event::Impl *wait_impl = get_runtime()->get_event_impl(wait_on);
-	GenEventImpl *after_lock = GenEventImpl::create_genevent();
-	Event e = after_lock->current_event();
+	Event after_lock = GenEventImpl::create_genevent()->current_event();
 	wait_impl->add_waiter(wait_on.gen, new DeferredLockRequest(*this, mode, exclusive, after_lock));
 	//printf("*(" IDFMT "/%d)\n", after_lock.id, after_lock.gen);
-	return e;
+	return after_lock;
       }
     }
 
@@ -3536,8 +3793,10 @@ namespace LegionRuntime {
 
       virtual ~DeferredUnlockRequest(void) { }
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	assert(!poisoned); // TODO: how to recover from a failure with a held reservation?
+	
 	lock.impl()->release();
         return true;
       }
@@ -3666,8 +3925,16 @@ namespace LegionRuntime {
 
       virtual ~DeferredLockDestruction(void) { }
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	// if our precondition is poisoned, don't release the reservation -
+	//  worst case, we just leak a single reservation
+	if(poisoned) {
+	  log_reservation.info("precondition poisoned, not destroying reservation " IDFMT,
+			       lock.id);
+	  return true;
+	}
+	
 	lock.impl()->release_reservation();
         return true;
       }
@@ -3715,6 +3982,116 @@ namespace LegionRuntime {
       }
     }
 
+    void show_event_waiters(FILE *f = stdout)
+    {
+      fprintf(f,"PRINTING ALL PENDING EVENTS:\n");
+      for(unsigned i = 0; i < gasnet_nodes(); i++) {
+	Node *n = &get_runtime()->nodes[i];
+        // Iterate over all the events and get their implementations
+        for (unsigned long j = 0; j < n->events.max_entries(); j++) {
+          if (!n->events.has_entry(j))
+            continue;
+	  GenEventImpl *e = n->events.lookup_entry(j, i/*node*/);
+	  AutoHSLLock a2(e->mutex);
+
+	  // print anything with either local or remote waiters
+	  if(e->local_waiters.empty() && !e->remote_waiters)
+	    continue;
+
+          fprintf(f,"Event " IDFMT ": gen=%d subscr=%d local=%zd remote=%zd\n",
+		  e->me.id(), e->generation, e->gen_subscribed, 
+		  e->local_waiters.size(), e->remote_waiters.size());
+	  for(std::map<Event::gen_t, std::vector<EventWaiter *> >::iterator it2 = e->local_waiters.begin();
+	      it2 != e->local_waiters.end();
+	      it2++) {
+	    for(std::vector<EventWaiter *>::iterator it = it2->second.begin();
+		it != it2->second.end();
+		it++) {
+	      fprintf(f, "  [%d] L:%p ", it2->first, *it);
+	      (*it)->print_info(f);
+	    }
+	  }
+	  // for(std::map<Event::gen_t, NodeMask>::const_iterator it = e->remote_waiters.begin();
+	  //     it != e->remote_waiters.end();
+	  //     it++) {
+	  //   fprintf(f, "  [%d] R:", it->first);
+	  //   for(int k = 0; k < MAX_NUM_NODES; k++)
+	  //     if(it->second.is_set(k))
+	  // 	fprintf(f, " %d", k);
+	  //   fprintf(f, "\n");
+	  // }
+	}
+
+        for (unsigned long j = 0; j < n->barriers.max_entries(); j++) {
+          if (!n->barriers.has_entry(j))
+            continue;
+          BarrierImpl *b = n->barriers.lookup_entry(j, i/*node*/); 
+          AutoHSLLock a2(b->mutex);
+          // skip any barriers with no waiters
+          if (b->generations.empty())
+            continue;
+
+          fprintf(f,"Barrier " IDFMT ": gen=%d subscr=%d\n",
+                  b->me.id(), b->generation, b->gen_subscribed);
+          for (std::map<Event::gen_t, BarrierImpl::Generation*>::const_iterator git = 
+                b->generations.begin(); git != b->generations.end(); git++)
+          {
+            const std::vector<EventWaiter*> &waiters = git->second->local_waiters;
+            for (std::vector<EventWaiter*>::const_iterator it = 
+                  waiters.begin(); it != waiters.end(); it++)
+            {
+              fprintf(f, "  [%d] L:%p ", git->first, *it);
+              (*it)->print_info(f);
+            }
+          }
+        }
+      }
+#if 0
+      // // convert from events to barriers
+      // fprintf(f,"PRINTING ALL PENDING EVENTS:\n");
+      // for(int i = 0; i < gasnet_nodes(); i++) {
+      // 	Node *n = &get_runtime()->nodes[i];
+      //   // Iterate over all the events and get their implementations
+      //   for (unsigned long j = 0; j < n->events.max_entries(); j++) {
+      //     if (!n->events.has_entry(j))
+      //       continue;
+      // 	  Event::Impl *e = n->events.lookup_entry(j, i/*node*/);
+      // 	  AutoHSLLock a2(e->mutex);
+
+      // 	  // print anything with either local or remote waiters
+      // 	  if(e->local_waiters.empty() && e->remote_waiters.empty())
+      // 	    continue;
+
+      //     fprintf(f,"Event " IDFMT ": gen=%d subscr=%d local=%zd remote=%zd\n",
+      // 		  e->me.id, e->generation, e->gen_subscribed, 
+      // 		  e->local_waiters.size(), e->remote_waiters.size());
+      // 	  for(std::map<Event::gen_t, std::vector<EventWaiter *> >::iterator it = e->local_waiters.begin();
+      // 	      it != e->local_waiters.end();
+      // 	      it++) {
+      // 	    for(std::vector<EventWaiter *>::iterator it2 = it->second.begin();
+      // 		it2 != it->second.end();
+      // 		it2++) {
+      // 	      fprintf(f, "  [%d] L:%p ", it->first, *it2);
+      // 	      (*it2)->print_info(f);
+      // 	    }
+      // 	  }
+      // 	  for(std::map<Event::gen_t, NodeMask>::const_iterator it = e->remote_waiters.begin();
+      // 	      it != e->remote_waiters.end();
+      // 	      it++) {
+      // 	    fprintf(f, "  [%d] R:", it->first);
+      // 	    for(int k = 0; k < MAX_NUM_NODES; k++)
+      // 	      if(it->second.is_set(k))
+      // 		fprintf(f, " %d", k);
+      // 	    fprintf(f, "\n");
+      // 	  }
+      // 	}
+      // }
+#endif
+
+      fprintf(f,"DONE\n");
+      fflush(f);
+    }
+
     ///////////////////////////////////////////////////
     // Memory
 
@@ -3741,6 +4118,12 @@ namespace LegionRuntime {
     Memory::Impl *Memory::impl(void) const
     {
       return get_runtime()->get_memory_impl(*this);
+    }
+
+    void Memory::report_memory_fault(int reason,
+				     const void *payload, size_t payload_size) const
+    {
+      assert(0 && "fault injection not implemented yet");
     }
 
     /*static*/ const Memory Memory::NO_MEMORY = { 0 };
@@ -4220,8 +4603,7 @@ namespace LegionRuntime {
           }
 	    
 	  if(args.event.exists())
-	    get_runtime()->get_genevent_impl(args.event)->trigger(args.event.gen,
-									   gasnet_mynode());
+	    GenEventImpl::local_trigger(args.event, false /*not poisoned*/);
 	  break;
 	}
 
@@ -4233,8 +4615,7 @@ namespace LegionRuntime {
 	  impl->put_bytes(args.offset, data, datalen);
 
 	  if(args.event.exists())
-	    get_runtime()->get_genevent_impl(args.event)->trigger(args.event.gen,
-									   gasnet_mynode());
+	    GenEventImpl::local_trigger(args.event, false /*not poisoned*/);
 	  break;
 	}
 
@@ -4277,7 +4658,7 @@ namespace LegionRuntime {
 	    partial_remote_writes.erase(it);
 	    gasnet_hsl_unlock(&partial_remote_writes_lock);
 	    if(e.exists())
-	      get_runtime()->get_genevent_impl(e)->trigger(e.gen, gasnet_mynode());
+	      GenEventImpl::local_trigger(e, false /*not poisoned*/);
 	    return;
 	  }
 	}
@@ -4371,7 +4752,7 @@ namespace LegionRuntime {
 	    partial_remote_writes.erase(it);
 	    gasnet_hsl_unlock(&partial_remote_writes_lock);
 	    if(e.exists())
-	      get_runtime()->get_genevent_impl(e)->trigger(e.gen, gasnet_mynode());
+	      GenEventImpl::local_trigger(e, false /*not poisoned*/);
 	    return;
 	  }
 	}
@@ -4435,7 +4816,7 @@ namespace LegionRuntime {
 	    partial_remote_writes.erase(it);
 	    gasnet_hsl_unlock(&partial_remote_writes_lock);
 	    if(e.exists())
-	      get_runtime()->get_genevent_impl(e)->trigger(e.gen, gasnet_mynode());
+	      GenEventImpl::local_trigger(e, false /*not poisoned*/);
 	    return;
 	  }
 	}
@@ -5378,12 +5759,13 @@ namespace LegionRuntime {
     Logger::Category log_task("task");
     Logger::Category log_util("util");
 
-    Task::Task(Processor _proc, Processor::TaskFuncID _func_id,
+    Task::Task(Processor::Impl *_proc, Processor::TaskFuncID _func_id,
 	       const void *_args, size_t _arglen,
+	       Realm::ProfilingRequestSet *_prs,
 	       Event _finish_event, int _priority, int expected_count)
-      : proc(_proc), func_id(_func_id), arglen(_arglen),
-	finish_event(_finish_event), priority(_priority),
-        run_count(0), finish_count(expected_count)
+      : Realm::Operation(_finish_event, _priority, _prs),
+	proc(_proc), func_id(_func_id), arglen(_arglen),
+	run_count(0), finish_count(expected_count)
     {
       if(arglen) {
 	args = malloc(arglen);
@@ -5397,23 +5779,58 @@ namespace LegionRuntime {
       free(args);
     }
 
+    /*virtual*/ bool Task::mark_ready(void)
+    {
+      // call parent implementation first - if it returns false, a cancellation
+      //  request beat us
+      if(!Operation::mark_ready()) {
+	remove_reference();
+	return false;
+      }
+
+      // now add ourselves to the run queue - it now owns the reference
+      proc->enqueue_task(this);
+      return true;
+    }
+
+    /*virtual*/ bool Task::attempt_cancellation(int error_code)
+    {
+      // if parent implementation succeeds, we're done
+      if(Operation::attempt_cancellation(error_code))
+	return true;
+
+      // TODO: attempt to signal thread currently running task
+
+      return false;
+    }
+
     class DeferredTaskSpawn : public EventWaiter {
     public:
-      DeferredTaskSpawn(Processor::Impl *_proc, Task *_task) 
-        : proc(_proc), task(_task) {}
+      DeferredTaskSpawn(Task *_task) 
+        : task(_task) {}
 
       virtual ~DeferredTaskSpawn(void)
       {
         // we do _NOT_ own the task - do not free it
       }
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
-        log_task.debug("deferred task now ready: func=%d finish=" IDFMT "/%d",
-                 task->func_id, 
-                 task->finish_event.id, task->finish_event.gen);
+	if(poisoned) {
+	  log_task.info("deferred task poisoned: func=%d finish=" IDFMT "/%d",
+			task->func_id, 
+			task->finish_event.id, task->finish_event.gen);
+	  // pretty much guaranteed to succeed
+	  bool worked = task->attempt_cancellation(Realm::Faults::ERROR_POISONED_PRECONDITION);
+	  assert(worked);
+	  task->remove_reference();
+	} else {	
+	  log_task.debug("deferred task now ready: func=%d finish=" IDFMT "/%d",
+			 task->func_id, 
+			 task->finish_event.id, task->finish_event.gen);
 
-        proc->enqueue_task(task);
+	  task->mark_ready();
+	}
 
         return true;
       }
@@ -5421,11 +5838,10 @@ namespace LegionRuntime {
       virtual void print_info(FILE *f)
       {
         fprintf(f,"deferred task: func=%d proc=" IDFMT " finish=" IDFMT "/%d\n",
-               task->func_id, task->proc.id, task->finish_event.id, task->finish_event.gen);
+               task->func_id, task->proc->me.id, task->finish_event.id, task->finish_event.gen);
       }
 
     protected:
-      Processor::Impl *proc;
       Task *task;
     };
 
@@ -5536,18 +5952,22 @@ namespace LegionRuntime {
 
     /*virtual*/ void ProcessorGroup::spawn_task(Processor::TaskFuncID func_id,
 						const void *args, size_t arglen,
+						const Realm::ProfilingRequestSet& prs,
 						//std::set<RegionInstance> instances_needed,
 						Event start_event, Event finish_event,
 						int priority)
     {
       // create a task object and insert it into the queue
-      Task *task = new Task(me, func_id, args, arglen, 
+      Task *task = new Task(this, func_id, args, arglen,
+			    new Realm::ProfilingRequestSet(prs),
                             finish_event, priority, members.size());
 
+      Realm::operation_table.add_local_operation(finish_event, task);
+
       if (start_event.has_triggered())
-        enqueue_task(task);
+	task->mark_ready();
       else
-        start_event.impl()->add_waiter(start_event.gen, new DeferredTaskSpawn(this, task));
+        start_event.impl()->add_waiter(start_event.gen, new DeferredTaskSpawn(task));
     }
 
     class LocalProcessor : public Processor::Impl {
@@ -5590,7 +6010,7 @@ namespace LegionRuntime {
 	  log_task(((func_id == 3) ? LEVEL_SPEW : LEVEL_INFO), 
 		   "task end: %d (%p) (%s)", func_id, fptr, argstr);
 	  if(finish_event.exists())
-	    finish_event.impl()->trigger(finish_event.gen, gasnet_mynode());
+	    GenEventImpl::local_trigger(finish_event, false /*not poisoned*/);
 	}
 
 	LocalProcessor *proc;
@@ -5623,10 +6043,12 @@ namespace LegionRuntime {
 	      event.impl()->add_waiter(event.gen, this);
 	  }
 
-	  virtual bool event_triggered(void)
+	  virtual bool event_triggered(bool poisoned)
 	  {
-	    log_task.info("thread %p notified for event " IDFMT "/%d",
-			  thread, event.id, event.gen);
+	    // we don't deal with poison here - the caller will re-check for
+	    //  poison
+	    log_task.info("thread %p notified for event " IDFMT "/%d poison=%d",
+			  thread, event.id, event.gen, poisoned);
 
 	    // now take the thread's (really the processor's) lock and see if
 	    //  this thread is asleep on this event - if so, make him 
@@ -5736,15 +6158,27 @@ namespace LegionRuntime {
 			        this, proc->me.id, newtask);
 
 		  al.release();
+
+		  // temporarily removing this task from the thread
+		  assert(ThreadLocal::current_task != 0);
+		  Task *suspended_task = ThreadLocal::current_task;
+		  ThreadLocal::current_task = 0;
+
                   if (__sync_fetch_and_add(&(newtask->run_count),1) == 0)
                     run_task(newtask);
+
+		  // now restoring our task to be "current"
+		  assert(ThreadLocal::current_task == 0);
+		  ThreadLocal::current_task = suspended_task;
+
 		  al.reacquire();
 
 		  log_task.info("thread %p (proc " IDFMT ") done with inner task %p, back to waiting on " IDFMT "/%d",
 			        this, proc->me.id, newtask, wait_for.id, wait_for.gen);
 
                   if (__sync_add_and_fetch(&(newtask->finish_count),-1) == 0)
-                    delete newtask;
+		    newtask->remove_reference();
+
 		  continue;
 	        }
 	      }
@@ -5881,14 +6315,15 @@ namespace LegionRuntime {
                   log_task.info("thread finished running task %p for proc " IDFMT "",
                                 newtask, proc->me.id);
                   if (__sync_add_and_fetch(&(newtask->finish_count),-1) == 0)
-                    delete newtask;
+		    newtask->remove_reference();
+
                   al.reacquire();
 
                   state = STATE_IDLE;
                   proc->active_thread_count--;
                   
                 } else if (__sync_add_and_fetch(&(newtask->finish_count),-1) == 0) {
-                  delete newtask;
+		  newtask->remove_reference();
                 }
 	        continue;
               }
@@ -5929,8 +6364,8 @@ namespace LegionRuntime {
 
 	      log_task.info("finished processor shutdown task: proc=" IDFMT "", proc->me.id);
 	    }
-	    if(proc->shutdown_event)
-	      proc->shutdown_event->trigger_current();
+	    if(proc->shutdown_event.exists())
+	      GenEventImpl::local_trigger(proc->shutdown_event, false /*not triggered*/);
             proc->finished();
 	  }
 
@@ -5943,50 +6378,12 @@ namespace LegionRuntime {
         }
       };
 
-      class DeferredTaskSpawn : public EventWaiter {
-      public:
-	DeferredTaskSpawn(Task *_task) : task(_task) {}
-
-	virtual ~DeferredTaskSpawn(void)
-	{
-	  // we do _NOT_ own the task - do not free it
-	}
-
-	virtual bool event_triggered(void)
-	{
-	  log_task.debug("deferred task now ready: func=%d finish=" IDFMT "/%d",
-		   task->func_id, 
-		   task->finish_event.id, task->finish_event.gen);
-
-	  // add task to processor's ready queue
-#ifdef SHARED_TASK_QUEUE
-          if(task->func_id && task->proc->shared_queue) {
-            // always insert into shared queue for now
-            task->proc->shared_queue->add(task);
-            return true;
-          }
-#endif
-	  ((LocalProcessor *)(task->proc.impl()))->enqueue_task(task);
-
-          return true;
-	}
-
-	virtual void print_info(FILE *f)
-	{
-	  fprintf(f,"deferred task: func=%d proc=" IDFMT " finish=" IDFMT "/%d\n",
-		 task->func_id, task->proc.id, task->finish_event.id, task->finish_event.gen);
-	}
-
-      protected:
-	Task *task;
-      };
-
       LocalProcessor(Processor _me, int _core_id, 
 		     int _total_threads = 1, int _max_active_threads = 1)
 	: Processor::Impl(_me, Processor::LOC_PROC), core_id(_core_id),
 	  total_threads(_total_threads),
 	  active_thread_count(0), max_active_threads(_max_active_threads),
-	  init_done(false), shutdown_requested(false), shutdown_event(0)
+	  init_done(false), shutdown_requested(false), shutdown_event(Event::NO_EVENT)
       {
         gasnet_hsl_init(&mutex);
       }
@@ -6015,7 +6412,7 @@ namespace LegionRuntime {
 	if(task->func_id == 0) {
 	  log_task.info("shutdown request received!");
 	  shutdown_requested = true;
-	  shutdown_event = get_runtime()->get_genevent_impl(task->finish_event);
+	  shutdown_event = task->finish_event;
           // Wake up any available threads that may be sleeping
           while (!avail_threads.empty()) {
             Thread *thread = avail_threads.front();
@@ -6024,6 +6421,9 @@ namespace LegionRuntime {
 	    gasnett_cond_signal(&thread->condvar);
             //thread->set_task_and_wake(task);
           }
+
+	  task->remove_reference();  // not actually queued
+
 	  return;
 	}
 
@@ -6104,13 +6504,17 @@ namespace LegionRuntime {
 
       virtual void spawn_task(Processor::TaskFuncID func_id,
 			      const void *args, size_t arglen,
+			      const Realm::ProfilingRequestSet& prs,
 			      //std::set<RegionInstance> instances_needed,
 			      Event start_event, Event finish_event,
                               int priority)
       {
 	// create task object to hold args, etc.
-	Task *task = new Task(me, func_id, args, arglen, finish_event, 
+	Task *task = new Task(this, func_id, args, arglen,
+			      new Realm::ProfilingRequestSet(prs), finish_event,
                               priority, 1/*users*/);
+
+	Realm::operation_table.add_local_operation(finish_event, task);
 
 	// early out - if the event has obviously triggered (or is NO_EVENT)
 	//  don't build up continuation
@@ -6118,11 +6522,11 @@ namespace LegionRuntime {
 	  log_task.info("new ready task: func=%d start=" IDFMT "/%d finish=" IDFMT "/%d",
 		   func_id, start_event.id, start_event.gen,
 		   finish_event.id, finish_event.gen);
-          enqueue_task(task);
+	  task->mark_ready();
 	} else {
 	  log_task.debug("deferring spawn: func=%d event=" IDFMT "/%d",
 		   func_id, start_event.id, start_event.gen);
-	  start_event.impl()->add_waiter(start_event.gen, new DeferredTaskSpawn(/*this,*/ task));
+	  start_event.impl()->add_waiter(start_event.gen, new DeferredTaskSpawn(task));
 	}
       }
 
@@ -6136,9 +6540,9 @@ namespace LegionRuntime {
       std::set<Thread *> all_threads;
       gasnet_hsl_t mutex;
       bool init_done, shutdown_requested;
-      GenEventImpl *shutdown_event;
+      Event shutdown_event;
     };
-
+    
     void PreemptableThread::start_thread(size_t stack_size, int core_id, const char *debug_name)
     {
       pthread_attr_t attr;
@@ -6165,11 +6569,36 @@ namespace LegionRuntime {
       log_util(((task->func_id == 3) ? LEVEL_SPEW : LEVEL_INFO), 
                "utility task start: %d (%p) (%s)", task->func_id, fptr, argstr);
 #endif
+
+      // last chance check to see if the task got cancelled
+      bool ok_to_run = task->mark_started();
+      if(!ok_to_run) {
+	return;
+      }
+
 #ifdef EVENT_GRAPH_TRACE
       start_enclosing(task->finish_event);
       unsigned long long start = TimeStamp::get_current_time_in_micros();
 #endif
+
+      assert(ThreadLocal::current_task == 0);
+      ThreadLocal::current_task = task;
+      bool successful_completion = true; // let's be optimistic...
+      bool terminated_early = false;
+#ifdef REALM_UNWIND_WITH_EXCEPTIONS
+      try {
+	(*fptr)(task->args, task->arglen, (actual_proc.exists() ? actual_proc : task->proc->me));
+      }
+      catch (RealmStackUnwindingException& e) {
+	terminated_early = true;
+	successful_completion = false;
+      }
+#else
+      // no stack unwinding - any exceptions will result in program termination
       (*fptr)(task->args, task->arglen, (actual_proc.exists() ? actual_proc : task->proc));
+#endif
+      ThreadLocal::current_task = 0;
+
 #ifdef EVENT_GRAPH_TRACE
       unsigned long long stop = TimeStamp::get_current_time_in_micros();
       finish_enclosing();
@@ -6181,8 +6610,11 @@ namespace LegionRuntime {
       log_util(((task->func_id == 3) ? LEVEL_SPEW : LEVEL_INFO), 
                "utility task end: %d (%p) (%s)", task->func_id, fptr, argstr);
 #endif
-      if(task->finish_event.exists())
-	get_runtime()->get_genevent_impl(task->finish_event)->trigger(task->finish_event.gen, gasnet_mynode());
+
+      if(terminated_early)
+	task->mark_terminated();
+      else
+	task->mark_completed(successful_completion);
     }
 
     /*static*/ bool PreemptableThread::preemptable_sleep(Event wait_for,
@@ -6228,8 +6660,10 @@ namespace LegionRuntime {
         unsigned long long start = TimeStamp::get_current_time_in_micros(); 
 #endif
         Event::Impl *impl = get_runtime()->get_event_impl(wait_for);
-        
-        while(!impl->has_triggered(wait_for.gen)) {
+
+	// our caller should recheck poison, so we can ignore it here
+	bool poisoned = false;
+        while(!impl->has_triggered(wait_for.gen, poisoned)) {
           if (!block) {
             gasnet_hsl_lock(&proc->mutex);
             if(!proc->task_queue.empty())
@@ -6242,7 +6676,8 @@ namespace LegionRuntime {
                   run_task(task, proc->me);
 		log_util.info("done with task %p (%d) in utility thread", task, task->func_id);
                 if (__sync_add_and_fetch(&(task->finish_count),-1) == 0)
-                  delete task;
+		  task->remove_reference();
+
 		// Continue since we no longer hold the lock
 		continue;
 	      }
@@ -6306,7 +6741,7 @@ namespace LegionRuntime {
 	      proc->shutdown_requested = true;
 	      // wake up any other threads that are sleeping
 	      gasnett_cond_broadcast(&proc->condvar);
-	      delete task;
+	      task->remove_reference();
 	      continue;
 	    }
 
@@ -6317,10 +6752,10 @@ namespace LegionRuntime {
               run_task(task, proc->me);
               log_util.info("done with task %p (%d) in utility thread", task, task->func_id);
               if (__sync_add_and_fetch(&(task->finish_count),-1) == 0)
-                delete task;
+		task->remove_reference();
               gasnet_hsl_lock(&proc->mutex);
             } else if (__sync_add_and_fetch(&(task->finish_count),-1) == 0) {
-              delete task;
+	      task->remove_reference();
             }
 	  }
 
@@ -6390,17 +6825,21 @@ namespace LegionRuntime {
 
     /*virtual*/ void UtilityProcessor::spawn_task(Processor::TaskFuncID func_id,
 						  const void *args, size_t arglen,
+						  const Realm::ProfilingRequestSet& prs,
 						  //std::set<RegionInstance> instances_needed,
 						  Event start_event, Event finish_event,
                                                   int priority)
     {
-      Task *task = new Task(this->me, func_id, args, arglen,
+      Task *task = new Task(this, func_id, args, arglen, 
+			    new Realm::ProfilingRequestSet(prs),
 			    finish_event, priority, 1/*users*/);
 
+      Realm::operation_table.add_local_operation(finish_event, task);
+
       if (start_event.has_triggered())
-        enqueue_task(task);
+	task->mark_ready();
       else
-        start_event.impl()->add_waiter(start_event.gen, new DeferredTaskSpawn(this, task));
+        start_event.impl()->add_waiter(start_event.gen, new DeferredTaskSpawn(task));
     }
 
     void UtilityProcessor::tasks_available(int priority)
@@ -6440,61 +6879,59 @@ namespace LegionRuntime {
 
     void Event::wait(bool block) const
     {
+      bool poisoned = false;
+      wait_faultaware(poisoned, block);
+
+      // caller isn't prepared to handle poison, so propagate failure
+      if(poisoned)
+	Processor::report_execution_fault(Realm::Faults::ERROR_POISONED_EVENT,
+					  this, sizeof(this));
+    }
+
+    void Event::wait_faultaware(bool& poisoned, bool block /*= false*/) const
+    {
       DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
-      if(!id) return;  // special case: never wait for NO_EVENT
+      if(!id) {
+	poisoned = false;
+	return;  // special case: never wait for NO_EVENT
+      }
       Event::Impl *e = get_runtime()->get_event_impl(*this);
 
-      // early out case too
-      if(e->has_triggered(gen)) return;
+      // we're stuck here until the event has triggered
+      while(!e->has_triggered(gen, poisoned)) {
+	// waiting on an event does not count against the low level's time
+	DetailedTimer::ScopedPush sp2(TIME_NONE);
 
-      // waiting on an event does not count against the low level's time
-      DetailedTimer::ScopedPush sp2(TIME_NONE);
+	// are we a thread that knows how to do something useful while waiting?
+	// (the waiting happens inside the call)
+	if(PreemptableThread::preemptable_sleep(*this, block))
+	  continue;
 
-      // are we a thread that knows how to do something useful while waiting?
-      if(PreemptableThread::preemptable_sleep(*this, block))
-	return;
-
-      // figure out which thread we are - better be a local CPU thread!
-      void *ptr = gasnett_threadkey_get(cur_thread);
-      if(ptr != 0) {
-	assert(0);
-	LocalProcessor::Thread *thr = (LocalProcessor::Thread *)ptr;
-	thr->sleep_on_event(*this, block);
-	return;
-      }
-      // maybe a GPU thread?
+	// maybe a GPU thread?
 #ifdef USE_CUDA
-      ptr = gasnett_threadkey_get(gpu_thread_ptr);
-      if(ptr != 0) {
-	//assert(0);
-	//printf("oh, good - we're a gpu thread - we'll spin for now\n");
-	//printf("waiting for " IDFMT "/%d\n", id, gen);
-	while(!e->has_triggered(gen)) {
+	{
+	  void *ptr = gasnett_threadkey_get(gpu_thread_ptr);
+	  if(ptr != 0) {
 #ifdef __SSE2__
-          _mm_pause();
+	    _mm_pause();
 #else
-          usleep(1000);
+	    usleep(1000);
 #endif
+          }
+	  continue;
         }
-	//printf("done\n");
-	return;
-      }
 #endif
-      // we're probably screwed here - try waiting and polling gasnet while
-      //  we wait
-      //printf("waiting on event, polling gasnet to hopefully not die\n");
-      while(!e->has_triggered(gen)) {
-	// can't poll here - the GPU DMA code sometimes polls from inside an active
-	//  message handler (consider turning polling back on once that's fixed)
-	//do_some_polling();
+
+	// we're probably screwed here - try waiting and polling gasnet while
+	//  we wait
+	//printf("waiting on event, polling gasnet to hopefully not die\n");
 #ifdef __SSE2__
 	_mm_pause();
 #endif
-	// no sleep - we don't want an OS-scheduler-latency here
-	//usleep(10000);
       }
-      return;
-      //assert(ptr != 0);
+
+      // once we escape from the loop, the event has triggered and we know
+      //  whether it was poisoned
     }
 
     void Event::external_wait(void) const
@@ -6504,12 +6941,17 @@ namespace LegionRuntime {
       Event::Impl *e = get_runtime()->get_event_impl(*this);
 
       // early out case too
-      if(e->has_triggered(gen)) return;
+      bool poisoned = false;
+      if(e->has_triggered(gen, poisoned)) {
+	assert(!poisoned);
+	return;
+      }
 
       // waiting on an event does not count against the low level's time
       DetailedTimer::ScopedPush sp2(TIME_NONE);
 
-      e->external_wait(gen);
+      e->external_wait(gen, poisoned);
+      assert(!poisoned);
     }
 
     // can't be static if it's used in a template...
@@ -6520,7 +6962,8 @@ namespace LegionRuntime {
       Processor::Impl *p = args.proc.impl();
       log_task.debug("remote spawn request: proc_id=" IDFMT " task_id=%d event=" IDFMT "/%d",
 	       args.proc.id, args.func_id, args.start_event.id, args.start_event.gen);
-      p->spawn_task(args.func_id, data, datalen,
+      // TODO: fish profiling request out of data
+      p->spawn_task(args.func_id, data, datalen, Realm::ProfilingRequestSet(),
 		    args.start_event, args.finish_event, args.priority);
     }
 
@@ -6553,6 +6996,7 @@ namespace LegionRuntime {
 
       virtual void spawn_task(Processor::TaskFuncID func_id,
 			      const void *args, size_t arglen,
+			      const Realm::ProfilingRequestSet& prs,
 			      //std::set<RegionInstance> instances_needed,
 			      Event start_event, Event finish_event,
                               int priority)
@@ -6567,8 +7011,12 @@ namespace LegionRuntime {
 	msgargs.start_event = start_event;
 	msgargs.finish_event = finish_event;
         msgargs.priority = priority;
+	// TODO
+	assert(prs.request_count() == 0);
 	SpawnTaskMessage::request(ID(me).node(), msgargs, args, arglen,
 				  PAYLOAD_COPY);
+
+	Realm::operation_table.add_remote_operation(finish_event, ID(me).node());	
       }
     };
 
@@ -6628,6 +7076,16 @@ namespace LegionRuntime {
 			   //std::set<RegionInstance> instances_needed,
 			   Event wait_on, int priority) const
     {
+      // just call the new version with a dummy profiling request set
+      return spawn(func_id, args, arglen,
+		   Realm::ProfilingRequestSet(),
+		   wait_on, priority);
+    }
+
+    Event Processor::spawn(TaskFuncID func_id, const void *args, size_t arglen,
+			   const Realm::ProfilingRequestSet& prs,
+			   Event wait_on, int priority) const
+    {
       DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
       Processor::Impl *p = impl();
 
@@ -6645,8 +7103,58 @@ namespace LegionRuntime {
 #endif
 
       p->spawn_task(func_id, args, arglen, //instances_needed, 
+		    prs,
 		    wait_on, e, priority);
       return e;
+    }
+
+    /*static*/ void Processor::cancel_task(Event finish_event)
+    {
+      assert(0 && "fault injection not implemented yet");
+    }
+
+    namespace ThreadLocal {
+      __thread Task *current_task;
+    };
+
+    /*static*/ void Processor::report_execution_fault(int reason, 
+						      const void *payload, size_t payload_size)
+    {
+      Task *task = ThreadLocal::current_task;
+      if(task != 0) {
+	// ok, we have a task, but is anybody listening to its result status?
+	// (i.e. if we throw an error, is anybody going to catch it?)
+	if(task->pmc.wants_measurement<Realm::ProfilingMeasurements::OperationStatus>()) {
+	  task->status.error_code = reason;
+	  task->status.error_details.set(payload, payload_size);
+
+#ifdef REALM_UNWIND_WITH_EXCEPTIONS
+	  throw RealmStackUnwindingException();
+#else
+	  assert(0 && "this is where we need to unwind the stack");
+#endif
+	} else {
+	  // nobody listening, so this is a fatal error
+	  fprintf(stderr, "FATAL: Execution fault reported in a non-profiled task!\n");
+	}
+      } else {
+	// an execution fault reported outside of a task means something is seriously wrong
+	// we're going to die a horrible death below, but explain why now
+	fprintf(stderr, "HELP!  Exception fault reported outside of a task!\n");
+      }
+
+      fprintf(stderr, "Execution fault reason: %d\n", reason);
+      fprintf(stderr, "Execution fault details (%zd bytes):", payload_size);
+      for(size_t i = 0; i < payload_size; i++)
+	fprintf(stderr, " %02x", ((unsigned char *)payload)[i]);
+      fprintf(stderr, "\n");
+      assert(0);
+    }
+
+    void Processor::report_processor_fault(int reason, 
+					   const void *payload, size_t payload_size) const
+    {
+      assert(0 && "fault injection not implemented yet");
     }
 
     AddressSpace Processor::address_space(void) const
@@ -6688,7 +7196,7 @@ namespace LegionRuntime {
       //  know of - this should only happen for remote events, but if it does it means
       //  there are some generations we don't know about yet, so we can catch up (and
       //  notify any local waiters right away)
-      impl->check_for_catchup(e.gen - 1);
+      //impl->check_for_catchup(e.gen - 1);
 
       return impl;
     }
@@ -7210,10 +7718,18 @@ namespace LegionRuntime {
       DeferredInstDestroy(RegionInstance::Impl *i) : impl(i) { }
       virtual ~DeferredInstDestroy(void) { }
     public:
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	// if the precondition is poisoned, don't delete the instance - hope the
+	//  original requestor figures it out and re-requests deletiong
+	if(poisoned) {
+	  log_meta.info("instance NOT destroyed (poison): space=" IDFMT " id=" IDFMT "",
+			impl->metadata.is.id, impl->me.id);
+	  return true;
+	}
+	
         log_meta.info("instance destroyed: space=" IDFMT " id=" IDFMT "",
-                 impl->metadata.is.id, impl->me.id);
+		      impl->metadata.is.id, impl->me.id);
         impl->memory.impl()->destroy_instance(impl->me, true); 
         return true;
       }
@@ -8062,6 +8578,12 @@ namespace LegionRuntime {
     }
 
     /*static*/ const RegionInstance RegionInstance::NO_INST = { 0 };
+
+    void RegionInstance::report_instance_fault(int reason,
+					       const void *payload, size_t payload_size) const
+    {
+      assert(0 && "fault injection not implemented yet");
+    }
 
     // a generic accessor just holds a pointer to the impl and passes all 
     //  requests through
@@ -9761,6 +10283,7 @@ namespace LegionRuntime {
       hcount += RemoteMemAllocResponse::add_handler_entries(&handlers[hcount], "Remote Memory Allocation Response AM");
       hcount += CreateInstanceRequest::add_handler_entries(&handlers[hcount], "Create Instance Request AM");
       hcount += CreateInstanceResponse::add_handler_entries(&handlers[hcount], "Create Instance Response AM");
+      hcount += EventUpdateMessage::add_handler_entries(&handlers[hcount], "Event Update AM");
       hcount += RemoteCopyMessage::add_handler_entries(&handlers[hcount], "Remote Copy AM");
       hcount += ValidMaskRequestMessage::add_handler_entries(&handlers[hcount], "Valid Mask Request AM");
       hcount += ValidMaskDataMessage::add_handler_entries(&handlers[hcount], "Valid Mask Data AM");
@@ -9783,6 +10306,7 @@ namespace LegionRuntime {
       hcount += MetadataInvalidateMessage::ResponseMessage::add_handler_entries(&handlers[hcount], "Metadata Inval Ack AM");
       //hcount += TestMessage::add_handler_entries(&handlers[hcount], "Test AM");
       //hcount += TestMessage2::add_handler_entries(&handlers[hcount], "Test 2 AM");
+      hcount += Realm::OperationTable::register_handlers(&handlers[hcount]);
 
       init_endpoints(handlers, hcount, 
 		     gasnet_mem_size_in_mb, reg_mem_size_in_mb,
@@ -10391,6 +10915,22 @@ namespace LegionRuntime {
     {
       return impl->get_mem_mem_affinity(result, restrict_mem1, restrict_mem2);
     }
+    
+    static GASNetHSL subscriber_mutex;
+
+    void Runtime::add_subscription(MachineUpdateSubscriber *subscriber)
+    {
+      // must hold subscriber lock for this
+      AutoHSLLock a(subscriber_mutex);
+      update_subscriptions.insert(subscriber);
+    }
+
+    void Runtime::remove_subscription(MachineUpdateSubscriber *subscriber)
+    {
+      // must hold subscriber lock for this
+      AutoHSLLock a(subscriber_mutex);
+      update_subscriptions.erase(subscriber);
+    }
 
     struct MachineRunArgs {
       Runtime::Impl *r;
@@ -10481,8 +11021,9 @@ namespace LegionRuntime {
 	for(std::vector<Processor::Impl *>::const_iterator it = local_procs.begin();
 	    it != local_procs.end();
 	    it++) {
-	  (*it)->spawn_task(task_id, args, arglen, 
-			    Event::NO_EVENT, Event::NO_EVENT, 0/*priority*/);
+	  Event finish_event = GenEventImpl::create_genevent()->current_event();
+	  (*it)->spawn_task(task_id, args, arglen, Realm::ProfilingRequestSet(),
+			    Event::NO_EVENT, finish_event, 0/*priority*/);
 	  if(style != ONE_TASK_PER_PROC) break;
 	}
       }
@@ -10595,7 +11136,7 @@ namespace LegionRuntime {
 	  it++)
       {
         Event e = GenEventImpl::create_genevent()->current_event();
-	(*it)->spawn_task(0 /* shutdown task id */, 0, 0,
+	(*it)->spawn_task(0 /* shutdown task id */, 0, 0, Realm::ProfilingRequestSet(),
 			  Event::NO_EVENT, e, 0/*priority*/);
       }
     }
@@ -11183,6 +11724,17 @@ namespace LegionRuntime {
     template void *AccessorType::Generic::Untyped::raw_dense_ptr<1>(const Rect<1>& r, Rect<1>& subrect, ByteOffset &elem_stride);
     template void *AccessorType::Generic::Untyped::raw_dense_ptr<2>(const Rect<2>& r, Rect<2>& subrect, ByteOffset &elem_stride);
     template void *AccessorType::Generic::Untyped::raw_dense_ptr<3>(const Rect<3>& r, Rect<3>& subrect, ByteOffset &elem_stride);
+
+    void AccessorType::Generic::Untyped::report_fault(ptr_t ptr, size_t bytes, off_t offset /*= 0*/) const
+    {
+      assert(0 && "fault injection not implemented yet");
+    }
+
+    void AccessorType::Generic::Untyped::report_fault(const LowLevel::DomainPoint& dp,
+						      size_t bytes, off_t offset /*= 0*/) const
+    {
+      assert(0 && "fault injection not implemented yet");
+    }
   };
 
   namespace Arrays {

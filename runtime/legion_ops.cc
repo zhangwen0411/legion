@@ -50,7 +50,8 @@ namespace LegionRuntime {
         outstanding_commit_deps(0),
         outstanding_mapping_references(0),
         mapped(false), hardened(false), completed(false), 
-        committed(false), parent_ctx(NULL)
+        committed(false), parent_ctx(NULL), 
+	profiling_feedback_required(rt->resilient_mode)
     //--------------------------------------------------------------------------
     {
     }
@@ -301,6 +302,18 @@ namespace LegionRuntime {
     {
       // should only be called if overridden
       assert(false);
+    }
+
+    // called when the low-level runtime provides profiling
+    // feedback for an operation
+    //--------------------------------------------------------------------------
+    void Operation::profiler_feedback(GenerationID gen_profiled, 
+                                      int attempt_profiled,
+				      const Realm::ProfilingResponse& pr)
+    //--------------------------------------------------------------------------
+    {
+      printf("profiling feedback received for %p/%d (%d)\n", 
+              this, gen_profiled, attempt_profiled);
     }
 
     //--------------------------------------------------------------------------

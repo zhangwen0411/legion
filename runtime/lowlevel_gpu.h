@@ -109,6 +109,7 @@ namespace LegionRuntime {
 
       virtual void spawn_task(Processor::TaskFuncID func_id,
 			      const void *args, size_t arglen,
+			      const Realm::ProfilingRequestSet& prs,
 			      //std::set<RegionInstanceUntyped> instances_needed,
 			      Event start_event, Event finish_event,
                               int priority);

@@ -207,6 +207,9 @@ namespace LegionRuntime {
 	  void read_untyped(const LowLevel::DomainPoint& dp, void *dst, size_t bytes, off_t offset = 0) const;
 	  void write_untyped(const LowLevel::DomainPoint& dp, const void *src, size_t bytes, off_t offset = 0) const;
 
+	  void report_fault(ptr_t ptr, size_t bytes, off_t offset = 0) const;
+	  void report_fault(const LowLevel::DomainPoint& dp, size_t bytes, off_t offset = 0) const;
+
 	  RegionAccessor<Generic, void, void> get_untyped_field_accessor(off_t _field_offset, size_t _field_size)
 	  {
 	    return RegionAccessor<Generic, void, void>(Untyped(internal, field_offset + _field_offset));
@@ -293,6 +296,16 @@ namespace LegionRuntime {
 #endif
             write_untyped(ptr, &newval, sizeof(newval)); 
           }
+
+	  void report_fault(ptr_t ptr) const
+	  {
+	    Untyped::report_fault(ptr, 0, sizeof(T));
+	  }
+
+	  void report_fault(const LowLevel::DomainPoint& dp) const
+	  {
+	    Untyped::report_fault(dp, 0, sizeof(T));
+	  }
 
 	  T *raw_span_ptr(ptr_t ptr, size_t req_count, size_t& act_count, ByteOffset& offset)
 	  { return (T*)(Untyped::raw_span_ptr(ptr, req_count, act_count, offset)); }

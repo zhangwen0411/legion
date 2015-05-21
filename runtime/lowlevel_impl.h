@@ -42,7 +42,6 @@
 #ifdef CHECK_REENTRANT_MESSAGES
 GASNETT_THREADKEY_DEFINE(in_handler);
 #endif
-GASNETT_THREADKEY_DECLARE(cur_thread);
 
 #include <pthread.h>
 #include <string.h>
@@ -67,6 +66,8 @@ GASNETT_THREADKEY_DECLARE(cur_thread);
   } \
 } while(0)
 
+#include "realm/profiling.h"
+#include "realm/operation.h"
 
 namespace Realm {
   class Module;
@@ -108,106 +109,10 @@ namespace LegionRuntime {
     };
 #endif
 
-    // gasnet_hsl_t in object form for templating goodness
-    class GASNetHSL {
-    public:
-      GASNetHSL(void) { gasnet_hsl_init(&mutex); }
-      // Should never be copied
-      GASNetHSL(const GASNetHSL &rhs) { assert(false); }
-      ~GASNetHSL(void) { gasnet_hsl_destroy(&mutex); }
-
-      // Should never be copied
-      GASNetHSL& operator=(const GASNetHSL &rhs) { assert(false); return *this; }
-
-      void lock(void) { gasnet_hsl_lock(&mutex); }
-      void unlock(void) { gasnet_hsl_unlock(&mutex); }
-
-    protected:
-      friend class AutoHSLLock;
-      friend class GASNetCondVar;
-      gasnet_hsl_t mutex;
-    };
-
-    class AutoHSLLock {
-    public:
-      AutoHSLLock(gasnet_hsl_t &mutex) : mutexp(&mutex), held(true)
-      { 
-	log_mutex.spew("MUTEX LOCK IN %p", mutexp);
-	//printf("[%d] MUTEX LOCK IN %p\n", gasnet_mynode(), mutexp);
-	gasnet_hsl_lock(mutexp); 
-	log_mutex.spew("MUTEX LOCK HELD %p", mutexp);
-	//printf("[%d] MUTEX LOCK HELD %p\n", gasnet_mynode(), mutexp);
-      }
-      AutoHSLLock(gasnet_hsl_t *_mutexp) : mutexp(_mutexp), held(true)
-      { 
-	log_mutex.spew("MUTEX LOCK IN %p", mutexp);
-	//printf("[%d] MUTEX LOCK IN %p\n", gasnet_mynode(), mutexp);
-	gasnet_hsl_lock(mutexp); 
-	log_mutex.spew("MUTEX LOCK HELD %p", mutexp);
-	//printf("[%d] MUTEX LOCK HELD %p\n", gasnet_mynode(), mutexp);
-      }
-      AutoHSLLock(GASNetHSL &mutex) : mutexp(&mutex.mutex), held(true)
-      { 
-	log_mutex.spew("MUTEX LOCK IN %p", mutexp);
-	//printf("[%d] MUTEX LOCK IN %p\n", gasnet_mynode(), mutexp);
-	gasnet_hsl_lock(mutexp); 
-	log_mutex.spew("MUTEX LOCK HELD %p", mutexp);
-	//printf("[%d] MUTEX LOCK HELD %p\n", gasnet_mynode(), mutexp);
-      }
-      ~AutoHSLLock(void) 
-      {
-	if(held)
-	  gasnet_hsl_unlock(mutexp);
-	log_mutex.spew("MUTEX LOCK OUT %p", mutexp);
-	//printf("[%d] MUTEX LOCK OUT %p\n", gasnet_mynode(), mutexp);
-      }
-      void release(void)
-      {
-	assert(held);
-	gasnet_hsl_unlock(mutexp);
-	held = false;
-      }
-      void reacquire(void)
-      {
-	assert(!held);
-	gasnet_hsl_lock(mutexp);
-	held = true;
-      }
-    protected:
-      gasnet_hsl_t *mutexp;
-      bool held;
-    };
-
-    class GASNetCondVar {
-    public:
-      GASNetCondVar(GASNetHSL &_mutex) 
-	: mutex(_mutex)
-      {
-	gasnett_cond_init(&cond);
-      }
-
-      ~GASNetCondVar(void)
-      {
-	gasnett_cond_destroy(&cond);
-      }
-
-      // these require that you hold the lock when you call
-      void signal(void)
-      {
-	gasnett_cond_signal(&cond);
-      }
-
-      void wait(void)
-      {
-	gasnett_cond_wait(&cond, &mutex.mutex.lock);
-      }
-
-    public:
-      GASNetHSL &mutex;
-
-    protected:
-      gasnett_cond_t cond;
-    };
+#ifdef REALM_UNWIND_WITH_EXCEPTIONS
+    // need an exception class to unwind stacks
+    class RealmStackUnwindingException {};
+#endif
 
     typedef LegionRuntime::HighLevel::BitMask<NODE_MASK_TYPE,MAX_NUM_NODES,
                                               NODE_MASK_SHIFT,NODE_MASK_MASK> NodeMask;
@@ -642,7 +547,7 @@ namespace LegionRuntime {
     class EventWaiter {
     public:
       virtual ~EventWaiter(void) {}
-      virtual bool event_triggered(void) = 0;
+      virtual bool event_triggered(bool poisoned) = 0;
       virtual void print_info(FILE *f) = 0;
     };
 
@@ -650,12 +555,12 @@ namespace LegionRuntime {
     class Event::Impl {
     public:
       // test whether an event has triggered without waiting
-      virtual bool has_triggered(Event::gen_t needed_gen) = 0;
+      virtual bool has_triggered(Event::gen_t needed_gen, bool& poisoned) = 0;
 
       // causes calling thread to block until event has occurred
       //void wait(Event::gen_t needed_gen);
 
-      virtual void external_wait(Event::gen_t needed_gen) = 0;
+      virtual void external_wait(Event::gen_t needed_gen, bool& poisoned) = 0;
 
       virtual bool add_waiter(Event::gen_t needed_gen, EventWaiter *waiter/*, bool pre_subscribed = false*/) = 0;
     };
@@ -674,9 +579,9 @@ namespace LegionRuntime {
       Event current_event(void) const { Event e = me.convert<Event>(); e.gen = generation+1; return e; }
 
       // test whether an event has triggered without waiting
-      virtual bool has_triggered(Event::gen_t needed_gen);
+      virtual bool has_triggered(Event::gen_t needed_gen, bool& poisoned);
 
-      virtual void external_wait(Event::gen_t needed_gen);
+      virtual void external_wait(Event::gen_t needed_gen, bool& poisoned);
 
       virtual bool add_waiter(Event::gen_t needed_gen, EventWaiter *waiter/*, bool pre_subscribed = false*/);
 
@@ -687,13 +592,19 @@ namespace LegionRuntime {
 				Event ev5 = Event::NO_EVENT, Event ev6 = Event::NO_EVENT);
 
       // record that the event has triggered and notify anybody who cares
-      void trigger(Event::gen_t gen_triggered, int trigger_node, Event wait_on = Event::NO_EVENT);
+      void local_trigger(Event::gen_t gen_triggered, bool poisoned);
+      static void local_trigger(Event event_triggered, bool poisoned);
+      static void deferred_trigger(Event to_trigger, Event wait_on);
 
-      // if you KNOW you want to trigger the current event (which by definition cannot
-      //   have already been triggered) - this is quicker:
-      void trigger_current(void);
+      // inter-node messages come in two forms:
+      // 1) non-owner -> owner: a request to trigger a particular generation (possibly poisoned)
+      void perform_trigger(int trigger_node, Event::gen_t gen_triggered, bool poisoned);
 
-      void check_for_catchup(Event::gen_t implied_trigger_gen);
+      // 2) owner -> non-owner: an update of the state of the generational event - how many generations
+      //  have triggered and which, if any, were poisoned
+      void handle_remote_update(Event::gen_t new_generation, size_t num_poisoned, const Event::gen_t *poison_data);
+
+      //void check_for_catchup(Event::gen_t implied_trigger_gen);
 
     public: //protected:
       ID me;
@@ -704,7 +615,24 @@ namespace LegionRuntime {
       GASNetHSL mutex; // controls which local thread has access to internal data (not runtime-visible event)
 
       NodeSet remote_waiters;
-      std::vector<EventWaiter *> local_waiters; // set of local threads that are waiting on event
+
+      // we'll set an upper bound on how many times any given event can be poisoned - this keeps
+      // update messages from growing without bound
+      static const size_t POISONED_GENERATION_LIMIT = 16;
+
+      // only allocated if the set is non-empty
+      std::set<Event::gen_t> *poisoned_generations;
+
+      // local triggerings - if we're not the owner, but we've triggered/poisoned events,
+      //  we need to give consistent answers for those generations, so remember what we've
+      //  done until our view of the distributed event catches up
+      // value stored in map is whether generation was poisoned
+      std::map<Event::gen_t, bool> local_triggers;
+      bool has_local_triggers; // something we can check without a lock
+
+      // due to the risk of poisoned generations, we have to keep track of waiters
+      //  per generation
+      std::map<Event::gen_t, std::vector<EventWaiter *> > local_waiters;
     };
 
     class BarrierImpl : public Event::Impl {
@@ -719,9 +647,9 @@ namespace LegionRuntime {
 					 const void *initial_value = 0, size_t initial_value_size = 0);
 
       // test whether an event has triggered without waiting
-      virtual bool has_triggered(Event::gen_t needed_gen);
+      virtual bool has_triggered(Event::gen_t needed_gen, bool& poisoned);
 
-      virtual void external_wait(Event::gen_t needed_gen);
+      virtual void external_wait(Event::gen_t needed_gen, bool& poisoned);
 
       virtual bool add_waiter(Event::gen_t needed_gen, EventWaiter *waiter/*, bool pre_subscribed = false*/);
 
@@ -806,7 +734,7 @@ namespace LegionRuntime {
       // bitmasks of which remote nodes are waiting on a lock (or sharing it)
       NodeSet remote_waiter_mask, remote_sharer_mask;
       //std::list<LockWaiter *> local_waiters; // set of local threads that are waiting on lock
-      std::map<unsigned, std::deque<GenEventImpl *> > local_waiters;
+      std::map<unsigned, std::deque<Event> > local_waiters;
       bool requested; // do we have a request for the lock in flight?
 
       // local data protected by lock
@@ -820,9 +748,9 @@ namespace LegionRuntime {
 
       // created a GenEventImpl if needed to describe when reservation is granted
       Event acquire(unsigned new_mode, bool exclusive,
-		    GenEventImpl *after_lock = 0);
+		    Event after_lock = Event::NO_EVENT);
 
-      bool select_local_waiters(std::deque<GenEventImpl *>& to_wake);
+      bool select_local_waiters(std::deque<Event>& to_wake);
 
       void release(void);
 
@@ -921,23 +849,37 @@ namespace LegionRuntime {
     class ProcessorGroup;
 
     // information for a task launch
-    class Task {
+    class Task : public Realm::Operation {
     public:
-      Task(Processor _proc,
+      Task(Processor::Impl *_proc,
 	   Processor::TaskFuncID _func_id,
 	   const void *_args, size_t _arglen,
+	   Realm::ProfilingRequestSet *_prs,
 	   Event _finish_event, int _priority,
            int expected_count);
 
+    protected:
+      // handled via refcounting
       virtual ~Task(void);
 
-      Processor proc;
+    public:
+      // when ready, we need to add ourselves to a ready queue somewhere
+      virtual bool mark_ready(void);
+
+      // if the general cancellation doesn't work, we might be able to terminate
+      //  a running task
+      virtual bool attempt_cancellation(int error_code);
+
+      Processor::Impl *proc;
       Processor::TaskFuncID func_id;
       void *args;
       size_t arglen;
-      Event finish_event;
-      int priority;
       int run_count, finish_count;
+    };
+
+    // TLS values placed in a namespace to make use of them obvious
+    namespace ThreadLocal {
+      extern __thread Task *current_task;
     };
 
     class Processor::Impl {
@@ -957,6 +899,7 @@ namespace LegionRuntime {
 
       virtual void spawn_task(Processor::TaskFuncID func_id,
 			      const void *args, size_t arglen,
+			      const Realm::ProfilingRequestSet& prs,
 			      //std::set<RegionInstance> instances_needed,
 			      Event start_event, Event finish_event,
                               int priority) = 0;
@@ -991,7 +934,7 @@ namespace LegionRuntime {
 	int priority;
 	JobQueue *queue;
 
-	virtual bool event_triggered(void);
+	virtual bool event_triggered(bool poisoned);
 	virtual void print_info(FILE *f);
       };
 
@@ -1057,6 +1000,7 @@ namespace LegionRuntime {
 
       virtual void spawn_task(Processor::TaskFuncID func_id,
 			      const void *args, size_t arglen,
+			      const Realm::ProfilingRequestSet& prs,
 			      //std::set<RegionInstance> instances_needed,
 			      Event start_event, Event finish_event,
                               int priority);
@@ -1147,6 +1091,7 @@ namespace LegionRuntime {
 
       virtual void spawn_task(Processor::TaskFuncID func_id,
 			      const void *args, size_t arglen,
+			      const Realm::ProfilingRequestSet& prs,
 			      //std::set<RegionInstance> instances_needed,
 			      Event start_event, Event finish_event,
                               int priority);
@@ -1457,8 +1402,8 @@ namespace LegionRuntime {
     protected:
       GASNetHSL mutex;
       State state;  // current state
-      GenEventImpl *valid_event_impl; // event to track receipt of in-flight request (if any)
-      NodeSet remote_copies;
+      Event valid_event; // event to track receipt of in-flight request (if any)
+      NodeSet remote_copies;    // bitmask to track which nodes have remote copies of metdata
     };
 
     class RegionInstance::Impl {
@@ -1569,7 +1514,6 @@ namespace LegionRuntime {
       int valid_mask_count;
       bool valid_mask_complete;
       Event valid_mask_event;
-      GenEventImpl *valid_mask_event_impl;
       int valid_mask_first, valid_mask_last;
       bool valid_mask_contig;
       ElementMask *avail_mask;

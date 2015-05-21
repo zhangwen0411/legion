@@ -37,6 +37,10 @@
 #include "atomics.h" // for __sync_fetch_and_add
 #endif
 
+namespace Realm {
+  class ProfilingRequestSet;
+};
+
 namespace LegionRuntime {
   namespace LowLevel {
     // forward class declarations because these things all refer to each other
@@ -285,6 +289,11 @@ namespace LegionRuntime {
 				Event ev3 = NO_EVENT, Event ev4 = NO_EVENT,
 				Event ev5 = NO_EVENT, Event ev6 = NO_EVENT);
 
+      // fault-aware versions of the above (the above versions will cause the caller to
+      //  fault as well if a poisoned event is queried)
+      bool has_triggered_faultaware(bool& poisoned) const;
+      void wait_faultaware(bool& poisoned, bool block = false) const;
+
       // the following calls are used to give Realm bounds on when the UserEvent
       //  will be triggered - in addition to being useful for diagnostic purposes
       //  (e.g. detecting event cycles), having a "late bound" (i.e. an event that
@@ -305,6 +314,10 @@ namespace LegionRuntime {
     public:
       static UserEvent create_user_event(void);
       void trigger(Event wait_on = Event::NO_EVENT) const;
+
+      // cancel the event - must be done _instead_ of triggering, and transitively
+      //  cancels any operation that uses this event as a precondition
+      void cancel(void) const;
 
       static const UserEvent NO_USER_EVENT;
     };
@@ -411,10 +424,26 @@ namespace LegionRuntime {
 	TASK_ID_FIRST_AVAILABLE    = 4,
       };
 
+      static Processor get_executing_processor(void);
+
       Event spawn(TaskFuncID func_id, const void *args, size_t arglen,
 		  Event wait_on = Event::NO_EVENT, int priority = 0) const;
 
-      static Processor get_executing_processor(void);
+      // request profiling of the spawned task
+      Event spawn(TaskFuncID func_id, const void *args, size_t arglen,
+		  const Realm::ProfilingRequestSet& prs,
+		  Event wait_on = Event::NO_EVENT, int priority = 0) const;
+
+      // request that the task associated with this finish event be cancelled
+      // has no effect if the task finishes successfully before the cancellation 
+      //  request arrives
+      static void cancel_task(Event finish_event);
+
+      // reports an execution fault in the currently running task
+      static void report_execution_fault(int reason, const void *payload, size_t payload_size);
+
+      // reports a problem with a processor in general (this is primarily for fault injection)
+      void report_processor_fault(int reason, const void *payload, size_t payload_size) const;
     };
 
     inline std::ostream& operator<<(std::ostream& os, Processor p) { return os << std::hex << p.id << std::dec; }
@@ -458,6 +487,9 @@ namespace LegionRuntime {
       Kind kind(void) const;
       // Return the maximum capacity of this memory
       size_t capacity(void) const;
+
+      // reports a problem with a memory in general (this is primarily for fault injection)
+      void report_memory_fault(int reason, const void *payload, size_t payload_size) const;
     };
 
     inline std::ostream& operator<<(std::ostream& os, Memory m) { return os << std::hex << m.id << std::dec; }
@@ -587,6 +619,10 @@ namespace LegionRuntime {
       IDType local_id(void) const;
 
       LegionRuntime::Accessor::RegionAccessor<LegionRuntime::Accessor::AccessorType::Generic> get_accessor(void) const;
+
+      // reports a problem with an instance in general (this is primarily for fault injection)
+      // accessors provide a way to report a more precise fault (e.g. the actual location)
+      void report_instance_fault(int reason, const void *payload, size_t payload_size) const;
     };
 
     inline std::ostream& operator<<(std::ostream& os, RegionInstance r) { return os << std::hex << r.id << std::dec; }
@@ -1363,6 +1399,18 @@ namespace LegionRuntime {
 			  const ElementMask& mask,
 			  Event wait_on = Event::NO_EVENT,
 			  ReductionOpID redop_id = 0, bool red_fold = false) const;
+
+      // variants of the above with requests for profiling
+      Event copy(const std::vector<CopySrcDstField>& srcs,
+		 const std::vector<CopySrcDstField>& dsts,
+		 const Realm::ProfilingRequestSet &prs,
+		 Event wait_on = Event::NO_EVENT,
+		 ReductionOpID redop_id = 0, bool red_fold = false) const;
+
+      // request that the copy associated with this finish event be cancelled
+      // has no effect if the task finishes successfully before the cancellation 
+      //  request arrives
+      static void cancel_copy(Event finish_event);
     };
 
     class IndexSpaceAllocator {
@@ -1798,9 +1846,35 @@ namespace LegionRuntime {
 
       void wait_for_shutdown(void);
 
+      // subscription interface for dynamic machine updates
+      class MachineUpdateSubscriber {
+      public:
+	virtual ~MachineUpdateSubscriber(void) {}
+
+	enum UpdateType { THING_ADDED,
+			  THING_REMOVED,
+			  THING_UPDATED
+	};
+
+	// callbacks occur on a thread that belongs to the runtime - please defer any
+	//  complicated processing if possible
+	virtual void processor_updated(Processor p, UpdateType update_type, 
+				       const void *payload, size_t payload_size) = 0;
+
+	virtual void memory_updated(Memory m, UpdateType update_type,
+				    const void *payload, size_t payload_size) = 0;
+      };
+
+      // currently, all subscriptions are global - we expect updates to be rare enough that
+      //  subscribers can do filtering themselves
+      void add_subscription(MachineUpdateSubscriber *subscriber);
+      void remove_subscription(MachineUpdateSubscriber *subscriber);
+
       class Impl;
     protected:
       Impl *impl;
+
+      std::set<MachineUpdateSubscriber *> update_subscriptions;
     };
 
     // Implementations for template functions

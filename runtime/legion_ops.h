@@ -48,6 +48,12 @@ namespace LegionRuntime {
         HLRTaskID hlr_id;
         Operation *proxy_this;
       };
+      struct ProfileResponseArgs {
+      public:
+	Operation *op;
+	GenerationID gen;
+	int attempt;
+      };
     public:
       Operation(Runtime *rt);
       virtual ~Operation(void);
@@ -140,6 +146,11 @@ namespace LegionRuntime {
       virtual bool is_close_op(void) const { return false; }
       // Determine if this operation is a partition operation
       virtual bool is_partition_op(void) const { return false; }
+      // called when the low-level runtime provides profiling
+      // feedback for an operation
+      virtual void profiler_feedback(GenerationID gen_profiled, 
+                                     int attempt_profiled,
+				     const ProfilingResponse& pr);
     public:
       // The following are sets of calls that we can use to 
       // indicate mapping, execution, resolution, completion, and commit
@@ -311,6 +322,9 @@ namespace LegionRuntime {
       unsigned must_epoch_index;
       // A set list or recorded dependences during logical traversal
       LegionList<LogicalUser,LOGICAL_REC_ALLOC>::track_aligned logical_records;
+      // Whether or not we're waiting on profiling feedback to determine
+      // successful completion
+      bool profiling_feedback_required;
     };
 
     /**

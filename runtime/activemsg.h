@@ -724,4 +724,104 @@ inline size_t get_lmb_size(int target_node) { return 0; }
 
 #endif // ifdef USE_GASNET
 
+namespace LegionRuntime {
+  namespace LowLevel {
+    // gasnet_hsl_t in object form for templating goodness
+    class GASNetHSL {
+    public:
+      GASNetHSL(void) { gasnet_hsl_init(&mutex); }
+      ~GASNetHSL(void) { gasnet_hsl_destroy(&mutex); }
+
+      void lock(void) { gasnet_hsl_lock(&mutex); }
+      void unlock(void) { gasnet_hsl_unlock(&mutex); }
+
+    protected:
+      friend class AutoHSLLock;
+      friend class GASNetCondVar;
+      gasnet_hsl_t mutex;
+    };
+
+    class AutoHSLLock {
+    public:
+      AutoHSLLock(gasnet_hsl_t &mutex) : mutexp(&mutex), held(true)
+      { 
+	//log_mutex(LEVEL_SPEW, "MUTEX LOCK IN %p", mutexp);
+	//printf("[%d] MUTEX LOCK IN %p\n", gasnet_mynode(), mutexp);
+	gasnet_hsl_lock(mutexp); 
+	//log_mutex(LEVEL_SPEW, "MUTEX LOCK HELD %p", mutexp);
+	//printf("[%d] MUTEX LOCK HELD %p\n", gasnet_mynode(), mutexp);
+      }
+      AutoHSLLock(gasnet_hsl_t *_mutexp) : mutexp(_mutexp), held(true)
+      { 
+	//log_mutex(LEVEL_SPEW, "MUTEX LOCK IN %p", mutexp);
+	//printf("[%d] MUTEX LOCK IN %p\n", gasnet_mynode(), mutexp);
+	gasnet_hsl_lock(mutexp); 
+	//log_mutex(LEVEL_SPEW, "MUTEX LOCK HELD %p", mutexp);
+	//printf("[%d] MUTEX LOCK HELD %p\n", gasnet_mynode(), mutexp);
+      }
+      AutoHSLLock(GASNetHSL &mutex) : mutexp(&mutex.mutex), held(true)
+      { 
+	//log_mutex(LEVEL_SPEW, "MUTEX LOCK IN %p", mutexp);
+	//printf("[%d] MUTEX LOCK IN %p\n", gasnet_mynode(), mutexp);
+	gasnet_hsl_lock(mutexp); 
+	//log_mutex(LEVEL_SPEW, "MUTEX LOCK HELD %p", mutexp);
+	//printf("[%d] MUTEX LOCK HELD %p\n", gasnet_mynode(), mutexp);
+      }
+      ~AutoHSLLock(void) 
+      {
+	if(held)
+	  gasnet_hsl_unlock(mutexp);
+	//log_mutex(LEVEL_SPEW, "MUTEX LOCK OUT %p", mutexp);
+	//printf("[%d] MUTEX LOCK OUT %p\n", gasnet_mynode(), mutexp);
+      }
+      void release(void)
+      {
+	assert(held);
+	gasnet_hsl_unlock(mutexp);
+	held = false;
+      }
+      void reacquire(void)
+      {
+	assert(!held);
+	gasnet_hsl_lock(mutexp);
+	held = true;
+      }
+    protected:
+      gasnet_hsl_t *mutexp;
+      bool held;
+    };
+
+    class GASNetCondVar {
+    public:
+      GASNetCondVar(GASNetHSL &_mutex) 
+	: mutex(_mutex)
+      {
+	gasnett_cond_init(&cond);
+      }
+
+      ~GASNetCondVar(void)
+      {
+	gasnett_cond_destroy(&cond);
+      }
+
+      // these require that you hold the lock when you call
+      void signal(void)
+      {
+	gasnett_cond_signal(&cond);
+      }
+
+      void wait(void)
+      {
+	gasnett_cond_wait(&cond, &mutex.mutex.lock);
+      }
+
+    public:
+      GASNetHSL &mutex;
+
+    protected:
+      gasnett_cond_t cond;
+    };
+  };
+};
+
 #endif

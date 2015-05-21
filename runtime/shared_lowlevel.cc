@@ -20,6 +20,7 @@
 #ifdef LEGION_PROF
 #include "legion_utilities.h"
 #endif
+#include "realm/profiling.h"
 
 #ifndef __GNUC__
 #include "atomics.h" // for __sync_fetch_and_add
@@ -270,6 +271,9 @@ namespace LegionRuntime {
       virtual bool event_triggered(void);
       virtual void print_info(FILE *f) = 0;
       virtual void perform(void) = 0;
+    public:
+      Realm::ProfilingMeasurements::OperationStatus op_status;
+      Realm::ProfilingMeasurements::OperationTimeline op_timeline;
     };
 
     class DMAQueue {
@@ -748,6 +752,9 @@ namespace LegionRuntime {
     public:
         virtual Event spawn(Processor::TaskFuncID func_id, const void * args,
                             size_t arglen, Event wait_on, int priority);
+        virtual Event spawn(Processor::TaskFuncID func_id, const void * args,
+                            size_t arglen, const Realm::ProfilingRequestSet& prs,
+			    Event wait_on, int priority);
         void run(void);
 	static void* start(void *proc);
 	void preempt(EventImpl *event, EventImpl::EventGeneration needed);
@@ -762,33 +769,43 @@ namespace LegionRuntime {
         public:
           TaskDesc(Processor::TaskFuncID id, const void *_args, size_t _arglen,
                    EventImpl *_complete, int _priority,
-                   int _start_arrivals, int _finish_arrivals, int _expected)
+                   int _start_arrivals, int _finish_arrivals, int _expected,
+		   Realm::ProfilingRequestSet *_prs)
             : func_id(id), args(0), arglen(_arglen),
               complete(_complete), priority(_priority), 
               start_arrivals(_start_arrivals), finish_arrivals(_finish_arrivals),
-              expected(_expected)
+              expected(_expected), prs(_prs)
           {
             if (arglen > 0)
             {
               args = malloc(arglen);
               memcpy(args, _args, arglen);
             }
+	    op_status.result = Realm::ProfilingMeasurements::OperationStatus::WAITING;
+	    if(prs)
+	      pmc.import_requests(*prs);
           }
           ~TaskDesc(void)
           {
             if (args)
               free(args);
+	    if (prs)
+	      delete prs;
           }
 	public:
-          Processor::TaskFuncID func_id;
-          void * args;
-          size_t arglen;
-          EventImpl *complete;
-          int priority;
-          // Used for shared tasks assigned to processor groups
-          int start_arrivals;
-          int finish_arrivals;
-          int expected;
+	  Processor::TaskFuncID func_id;
+	  void * args;
+	  size_t arglen;
+	  EventImpl *complete;
+	  int priority;
+	  // Used for shared tasks assigned to processor groups
+	  int start_arrivals;
+	  int finish_arrivals;
+	  int expected;
+	  Realm::ProfilingRequestSet *prs;
+	  Realm::ProfilingMeasurementCollection pmc;
+	  Realm::ProfilingMeasurements::OperationStatus op_status;
+	  Realm::ProfilingMeasurements::OperationTimeline op_timeline;
 	};
         class DeferredTask : public EventWaiter {
         public:
@@ -876,6 +893,10 @@ namespace LegionRuntime {
       virtual Event spawn(Processor::TaskFuncID func_id, const void * args,
 			  size_t arglen, Event wait_on, int priority);
 
+      virtual Event spawn(Processor::TaskFuncID func_id, const void * args,
+			  size_t arglen, const Realm::ProfilingRequestSet& prs,
+			  Event wait_on, int priority);
+
     protected:
       std::vector<ProcessorImpl *> members;
       size_t next_target;
@@ -904,6 +925,19 @@ namespace LegionRuntime {
 	if (!id) return;
 	EventImpl *e = Runtime::Impl::get_runtime()->get_event_impl(*this);
 	e->wait(gen,block);
+    }
+
+    // no fault propagation in the shared LLR, so poison bits are never set
+    bool Event::has_triggered_faultaware(bool& poisoned) const
+    {
+        poisoned = false;
+        return has_triggered();
+    }
+
+    void Event::wait_faultaware(bool& poisoned, bool block) const
+    {
+        poisoned = false;
+        wait(block);
     }
 
     // used by non-legion threads to wait on an event - always blocking
@@ -1945,6 +1979,15 @@ namespace LegionRuntime {
 	return p->spawn(func_id, args, arglen, wait_on, priority);
     }
 
+    Event Processor::spawn(Processor::TaskFuncID func_id, const void * args,
+			   size_t arglen, const Realm::ProfilingRequestSet& prs,
+			   Event wait_on, int priority) const
+    {
+        DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
+	ProcessorImpl *p = Runtime::Impl::get_runtime()->get_processor_impl(*this);
+	return p->spawn(func_id, args, arglen, prs, wait_on, priority);
+    }
+
     AddressSpace Processor::address_space(void) const
     {
       return 0;
@@ -1991,7 +2034,21 @@ namespace LegionRuntime {
     {
 	TaskDesc *task = new TaskDesc(func_id, args, arglen,
                                       Runtime::Impl::get_runtime()->get_free_event(),
-                                      priority, 0, 0, 1);
+                                      priority, 0, 0, 1, 0);
+	Event result = task->complete->get_event();
+
+        enqueue_task(task, wait_on);	
+	return result;
+    }
+
+    Event ProcessorImpl::spawn(Processor::TaskFuncID func_id, const void * args,
+			       size_t arglen, const Realm::ProfilingRequestSet& prs,
+			       Event wait_on, int priority)
+    {
+	TaskDesc *task = new TaskDesc(func_id, args, arglen,
+                                      Runtime::Impl::get_runtime()->get_free_event(),
+                                      priority, 0, 0, 1, 
+				      new Realm::ProfilingRequestSet(prs));
 	Event result = task->complete->get_event();
 
         enqueue_task(task, wait_on);	
@@ -2023,6 +2080,9 @@ namespace LegionRuntime {
 
     void ProcessorImpl::add_to_ready_queue(TaskDesc *task)
     {
+      // update operation timeline
+      task->op_timeline.ready_time = 123; // TODO
+
       // Better already hold the lock when calling this method
       // Common case
       if (ready_queue.empty() || (ready_queue.back()->priority >= task->priority))
@@ -2317,9 +2377,20 @@ namespace LegionRuntime {
                           assert(it != task_table.end());
 #endif
                           Processor::TaskFuncPtr func = it->second;
+			  task->op_status.result = Realm::ProfilingMeasurements::OperationStatus::TERMINATED_EARLY;
+			  task->op_timeline.start_time = 456; // TODO
                           func(task->args, task->arglen, proc);
+			  task->op_status.result = Realm::ProfilingMeasurements::OperationStatus::COMPLETED_SUCCESSFULLY;
+			  task->op_timeline.end_time = 789; // TODO
                           // Trigger the event indicating that the task has been run
                           task->complete->trigger();
+
+			  // report profiling data
+			  if(task->prs) {
+			    task->pmc.add_measurement(task->op_status);
+			    task->pmc.add_measurement(task->op_timeline);
+			    task->pmc.send_responses(*task->prs);
+			  }
                   }
                 }
                 // Now see if we need to delete it
@@ -2365,7 +2436,26 @@ namespace LegionRuntime {
       // Create a new task description and enqueue it for all the members
       TaskDesc *task = new TaskDesc(func_id, args, arglen,
                                     Runtime::Impl::get_runtime()->get_free_event(),
-                                    priority, 0, 0, members.size());
+                                    priority, 0, 0, members.size(), 0);
+      Event result = task->complete->get_event();
+
+      for (std::vector<ProcessorImpl*>::const_iterator it = members.begin();
+            it != members.end(); it++)
+      {
+        (*it)->enqueue_task(task, wait_on);
+      }
+      return result;
+    }
+
+    Event ProcessorGroup::spawn(Processor::TaskFuncID func_id, const void * args,
+				size_t arglen, const Realm::ProfilingRequestSet& prs,
+				Event wait_on, int priority)
+    {
+      // Create a new task description and enqueue it for all the members
+      TaskDesc *task = new TaskDesc(func_id, args, arglen,
+                                    Runtime::Impl::get_runtime()->get_free_event(),
+                                    priority, 0, 0, members.size(),
+				    new Realm::ProfilingRequestSet(prs));
       Event result = task->complete->get_event();
 
       for (std::vector<ProcessorImpl*>::const_iterator it = members.begin();
@@ -2384,8 +2474,8 @@ namespace LegionRuntime {
 
     class MemoryImpl {
     public:
-	MemoryImpl(size_t max, Memory::Kind k) 
-		: max_size(max), remaining(max), kind(k)
+        MemoryImpl(Memory m, size_t max, Memory::Kind k) 
+	  : mem(m), max_size(max), remaining(max), kind(k)
 	{
                 mutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
 		PTHREAD_SAFE_CALL(pthread_mutex_init(mutex,NULL));
@@ -2396,12 +2486,14 @@ namespace LegionRuntime {
                 free(mutex);
         }
     public:
+        Memory get_id(void) const { return mem; }
 	size_t remaining_bytes(void);
 	void* allocate_space(size_t size);
 	void free_space(void *ptr, size_t size);
         size_t total_space(void) const;  
         Memory::Kind get_kind(void) const;
     private:
+        Memory mem;
 	const size_t max_size;
 	size_t remaining;
 	pthread_mutex_t *mutex;
@@ -2922,6 +3014,7 @@ namespace LegionRuntime {
       CopyOperation(const std::vector<Domain::CopySrcDstField>& _srcs,
                     const std::vector<Domain::CopySrcDstField>& _dsts,
                     const Domain _domain,
+		    const Realm::ProfilingRequestSet& _prs,
                     ReductionOpID _redop_id, bool _red_fold,
                     EventImpl *_done_event)
         : srcs(_srcs), dsts(_dsts), 
@@ -2933,11 +3026,17 @@ namespace LegionRuntime {
         // If we don't have a done event, make one
         if (!done_event)
           done_event = Runtime::Impl::get_runtime()->get_free_event();
+
+	// make a copy of the request set
+	prs = new Realm::ProfilingRequestSet(_prs);
+	pmc.import_requests(*prs);
+	op_status.result = Realm::ProfilingMeasurements::OperationStatus::WAITING;
       }
 
       virtual ~CopyOperation(void)
       {
         PTHREAD_SAFE_CALL(pthread_mutex_destroy(&mutex));
+	delete prs;
       }
 
       virtual void perform(void);
@@ -2958,6 +3057,8 @@ namespace LegionRuntime {
       bool red_fold;
       EventImpl *done_event;
       pthread_mutex_t mutex;
+      Realm::ProfilingRequestSet *prs;
+      Realm::ProfilingMeasurementCollection pmc;
     };
 
     class ComputeIndexSpaces : public DMAOperation {
@@ -3163,10 +3264,12 @@ namespace LegionRuntime {
 		   ReductionOpID redop_id = 0, bool red_fold = false);
 
         static Event copy(const std::vector<Domain::CopySrcDstField>& srcs,
-		   const std::vector<Domain::CopySrcDstField>& dsts,
-		   const Domain domain,
-		   Event wait_on,
-		   ReductionOpID redop_id = 0, bool red_fold = false);
+			  const std::vector<Domain::CopySrcDstField>& dsts,
+			  const Domain domain,
+			  const Realm::ProfilingRequestSet& prs,
+			  Event wait_on,
+			  ReductionOpID redop_id = 0, bool red_fold = false);
+
     public:
         // Traverse up the tree to the parent region that owns the master allocator
         // Peform the operation and then update the element mask on the way back down
@@ -4244,7 +4347,9 @@ namespace LegionRuntime {
       DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
       //IndexSpace::Impl *r = Runtime::Impl::get_runtime()->get_metadata_impl(get_index_space());
       //return r->copy(srcs, dsts, *this, wait_on, redop_id, red_fold);
-      return IndexSpace::Impl::copy(srcs, dsts, *this, wait_on, redop_id, red_fold);
+      // no profiling data requested, so supply an empty request
+      Realm::ProfilingRequestSet prs;
+      return IndexSpace::Impl::copy(srcs, dsts, *this, prs, wait_on, redop_id, red_fold);
     }
 
     Event Domain::copy(const std::vector<CopySrcDstField>& srcs,
@@ -4256,7 +4361,9 @@ namespace LegionRuntime {
       //IndexSpace::Impl *r = Runtime::Impl::get_runtime()->get_metadata_impl(get_index_space());
       assert(0);
       //return r->copy(srcs, dsts, *this, wait_on, redop_id, red_fold);
-      return IndexSpace::Impl::copy(srcs, dsts, *this, wait_on, redop_id, red_fold);
+      // no profiling data requested, so supply an empty request
+      Realm::ProfilingRequestSet prs;
+      return IndexSpace::Impl::copy(srcs, dsts, *this, prs, wait_on, redop_id, red_fold);
     }
 
     Event Domain::copy_indirect(const CopySrcDstField &idx,
@@ -4280,6 +4387,18 @@ namespace LegionRuntime {
       // TODO: Sean needs to implement this
       assert(false);
       return Event::NO_EVENT;
+    }
+
+    Event Domain::copy(const std::vector<CopySrcDstField>& srcs,
+		       const std::vector<CopySrcDstField>& dsts,
+		       const Realm::ProfilingRequestSet &prs,
+		       Event wait_on /*= Event::NO_EVENT*/,
+		       ReductionOpID redop_id /*= 0*/, bool red_fold /*= false*/) const
+    {
+      DetailedTimer::ScopedPush sp(TIME_LOW_LEVEL);
+      //IndexSpace::Impl *r = Runtime::get_runtime()->get_metadata_impl(get_index_space());
+      //return r->copy(srcs, dsts, *this, wait_on, redop_id, red_fold);
+      return IndexSpace::Impl::copy(srcs, dsts, *this, prs, wait_on, redop_id, red_fold);
     }
 
     bool IndexSpace::Impl::activate(size_t num)
@@ -5142,6 +5261,8 @@ namespace LegionRuntime {
       LegionRuntime::HighLevel::LegionProf::register_copy_event(
             LegionRuntime::HighLevel::PROF_BEGIN_COPY);
 #endif
+      op_status.result = Realm::ProfilingMeasurements::OperationStatus::TERMINATED_EARLY;
+      op_timeline.start_time = 457; // TODO
 
       if (redop_id == 0)
       {
@@ -5193,8 +5314,19 @@ namespace LegionRuntime {
       LegionRuntime::HighLevel::LegionProf::register_copy_event(
             LegionRuntime::HighLevel::PROF_END_COPY);
 #endif
+
+      op_status.result = Realm::ProfilingMeasurements::OperationStatus::COMPLETED_SUCCESSFULLY;
+      op_timeline.start_time = 780; // TODO
+
       // Trigger the event indicating that we are done
       done_event->trigger();
+
+      // report profiling data
+      if(prs) {
+	pmc.add_measurement(op_status);
+	pmc.add_measurement(op_timeline);
+	pmc.send_responses(*prs);
+      }
     }
 
     void ComputeIndexSpaces::perform(void)
@@ -5371,13 +5503,16 @@ namespace LegionRuntime {
       srcs.push_back(Domain::CopySrcDstField(src_inst, 0, elem_size));
       dsts.push_back(Domain::CopySrcDstField(dst_inst, 0, elem_size));
 
-      return copy(srcs, dsts, domain, wait_on, redop_id, red_fold);
+      Realm::ProfilingRequestSet empty_prs;
+      return copy(srcs, dsts, domain, empty_prs, wait_on, redop_id, red_fold);
     }
     
     /*static*/
     Event IndexSpace::Impl::copy(const std::vector<Domain::CopySrcDstField>& srcs,
 				 const std::vector<Domain::CopySrcDstField>& dsts,
-				 Domain domain, Event wait_on,
+				 Domain domain,
+				 const Realm::ProfilingRequestSet& prs,
+				 Event wait_on,
 				 ReductionOpID redop_id /*= 0*/, bool red_fold /*= false*/)
     {
       EventImpl *done_event = NULL;
@@ -5389,6 +5524,7 @@ namespace LegionRuntime {
 #endif
       CopyOperation *co = new CopyOperation(srcs, dsts, 
 					    domain, //get_element_mask(), get_element_mask(),
+					    prs,
 					    redop_id, red_fold,
 					    done_event);
       return co->register_copy(wait_on);
@@ -5469,6 +5605,8 @@ namespace LegionRuntime {
 
     void DMAQueue::enqueue_dma(DMAOperation *op)
     {
+      op->op_timeline.ready_time = 124; // TODO
+
       if (num_dma_threads > 0)
       {
         PTHREAD_SAFE_CALL(pthread_mutex_lock(&dma_lock));
@@ -5524,6 +5662,60 @@ namespace LegionRuntime {
       fflush(stderr);
       while (true)
         sleep(1);
+    }
+
+    pthread_mutex_t subscriber_mutex;
+
+#ifdef DYNAMIC_MACHINE_UPDATES
+    static void send_processor_update(const std::set<Runtime::MachineUpdateSubscriber *>& update_subscriptions,
+				      Processor p, Runtime::MachineUpdateSubscriber::UpdateType update_type, 
+				      const void *payload, size_t payload_size)
+    {
+      // must hold subscriber lock for this
+      PTHREAD_SAFE_CALL(pthread_mutex_lock(&subscriber_mutex));
+
+      for(std::set<Runtime::MachineUpdateSubscriber *>::const_iterator it = update_subscriptions.begin();
+	  it != update_subscriptions.end();
+	  it++)
+	(*it)->processor_updated(p, update_type, payload, payload_size);
+
+      PTHREAD_SAFE_CALL(pthread_mutex_unlock(&subscriber_mutex));
+    }
+
+    static void send_memory_update(const std::set<Runtime::MachineUpdateSubscriber *>& update_subscriptions,
+				   Memory m, Runtime::MachineUpdateSubscriber::UpdateType update_type, 
+				   const void *payload, size_t payload_size)
+    {
+      // must hold subscriber lock for this
+      PTHREAD_SAFE_CALL(pthread_mutex_lock(&subscriber_mutex));
+
+      for(std::set<Runtime::MachineUpdateSubscriber *>::const_iterator it = update_subscriptions.begin();
+	  it != update_subscriptions.end();
+	  it++)
+	(*it)->memory_updated(m, update_type, payload, payload_size);
+
+      PTHREAD_SAFE_CALL(pthread_mutex_unlock(&subscriber_mutex));
+    }
+#endif
+
+    void Runtime::add_subscription(MachineUpdateSubscriber *subscriber)
+    {
+      // must hold subscriber lock for this
+      PTHREAD_SAFE_CALL(pthread_mutex_lock(&subscriber_mutex));
+      
+      update_subscriptions.insert(subscriber);
+      
+      PTHREAD_SAFE_CALL(pthread_mutex_unlock(&subscriber_mutex));
+    }
+
+    void Runtime::remove_subscription(MachineUpdateSubscriber *subscriber)
+    {
+      // must hold subscriber lock for this
+      PTHREAD_SAFE_CALL(pthread_mutex_lock(&subscriber_mutex));
+      
+      update_subscriptions.erase(subscriber);
+      
+      PTHREAD_SAFE_CALL(pthread_mutex_unlock(&subscriber_mutex));
     }
 
     ////////////////////////////////////////////////////////
@@ -5826,6 +6018,9 @@ namespace LegionRuntime {
         size_t cpu_l1_size_in_kb = LOCAL_MEM;
         size_t cpu_stack_size = STACK_SIZE;
 
+	// need a mutex to control acces to the subscriber list
+	PTHREAD_SAFE_CALL(pthread_mutex_init(&subscriber_mutex,NULL));
+
 #ifdef DEBUG_PRINT
 	PTHREAD_SAFE_CALL(pthread_mutex_init(&debug_mutex,NULL));
 #endif
@@ -5908,11 +6103,15 @@ namespace LegionRuntime {
             // Add this processor as utility user
             temp_utils[utility_idx]->add_utility_user(p, impl);
             processors.push_back(impl);
+	    // TODO: fix this!
+	    //send_processor_update(update_subscriptions, p, MachineUpdateSubscriber::THING_ADDED, 0, 0);
           }
           // Finally we can add the utility processors to the set of processors
           for (unsigned idx = 0; idx < num_utility_cpus; idx++)
           {
             processors.push_back(temp_utils[idx]);
+	    // TODO: fix this!
+	    //send_processor_update(update_subscriptions, temp_utils[idx]->get_id(), MachineUpdateSubscriber::THING_ADDED, 0, 0);
           }
         }
         else
@@ -5925,6 +6124,8 @@ namespace LegionRuntime {
             procs.insert(p);
             ProcessorImpl *impl = new ProcessorImpl(init_barrier, task_table, p, cpu_stack_size, (idx == 0));
             processors.push_back(impl);
+	    // TODO: fix this!
+	    //send_processor_update(update_subscriptions, impl->get_id(), MachineUpdateSubscriber::THING_ADDED, 0, 0);
           }
         }
 	
@@ -5972,11 +6173,13 @@ namespace LegionRuntime {
                 // Make the first memory null
 	        memories.push_back(NULL);
                 // Do the global memory
-		//Memory global;
-		//global.id = 1;
+		Memory global;
+		global.id = 1;
 		//memories.insert(global);
-		MemoryImpl *impl = new MemoryImpl(cpu_mem_size_in_mb*1024*1024, Memory::SYSTEM_MEM);
+		MemoryImpl *impl = new MemoryImpl(global, cpu_mem_size_in_mb*1024*1024, Memory::SYSTEM_MEM);
 		memories.push_back(impl);
+		// TODO: fix this!
+		//send_memory_update(update_subscriptions, impl->get_id(), MachineUpdateSubscriber::THING_ADDED, 0, 0);
 	}
         else
         {
@@ -5990,11 +6193,13 @@ namespace LegionRuntime {
         {
           for (unsigned id=2; id<=(num_cpus+1); id++)
           {
-	          //Memory m;
-                  //m.id = id;
+	          Memory m;
+                  m.id = id;
                   //memories.insert(m);
-                  MemoryImpl *impl = new MemoryImpl(cpu_l1_size_in_kb*1024, Memory::LEVEL1_CACHE);
+                  MemoryImpl *impl = new MemoryImpl(m, cpu_l1_size_in_kb*1024, Memory::LEVEL1_CACHE);
                   memories.push_back(impl);
+		  // TODO: fix this!
+		  //send_memory_update(update_subscriptions, impl->get_id(), MachineUpdateSubscriber::THING_ADDED, 0, 0);
           }
         }
 #if 0
@@ -6889,12 +7094,61 @@ namespace LegionRuntime {
       // TODO: implement this
       return false;
     }
-
   };
 
   namespace Arrays {
     //template<> class Mapping<1,1>;
     template <unsigned IDIM, unsigned ODIM>
     MappingRegistry<IDIM, ODIM> Mapping<IDIM, ODIM>::registry;
+  };
+
+  // fault injection not supported in shared LLR
+  namespace LowLevel {
+    /*static*/ void Processor::cancel_task(Event finish_event)
+    {
+      assert(0 && "fault injection not supported in shared LLR");
+    }
+
+    /*static*/ void Domain::cancel_copy(Event finish_event)
+    {
+      assert(0 && "fault injection not supported in shared LLR");
+    }
+
+    void UserEvent::cancel(void) const
+    {
+      assert(0 && "fault injection not supported in shared LLR"); 
+    }
+
+    /*static*/ void Processor::report_execution_fault(int reason, const void *payload, size_t payload_size)
+    {
+      assert(0 && "fault injection not supported in shared LLR");
+    }
+
+    void Processor::report_processor_fault(int reason, const void *payload, size_t payload_size) const
+    {
+      assert(0 && "fault injection not supported in shared LLR");
+    }
+
+    void Memory::report_memory_fault(int reason, const void *payload, size_t payload_size) const
+    {
+      assert(0 && "fault injection not supported in shared LLR");
+    }
+
+    void RegionInstance::report_instance_fault(int reason, const void *payload, size_t payload_size) const
+    {
+      assert(0 && "fault injection not supported in shared LLR");
+    }
+  };
+
+  namespace Accessor {
+    void AccessorType::Generic::Untyped::report_fault(ptr_t ptr, size_t bytes, off_t offset /*= 0*/) const
+    {
+      assert(0 && "fault injection not supported in shared LLR");
+    }
+
+    void AccessorType::Generic::Untyped::report_fault(const LowLevel::DomainPoint& dp, size_t bytes, off_t offset /*= 0*/) const
+    {
+      assert(0 && "fault injection not supported in shared LLR");
+    }
   };
 };

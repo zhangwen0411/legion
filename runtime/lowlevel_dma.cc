@@ -124,7 +124,7 @@ namespace LegionRuntime {
 
 	void sleep_on_event(Event e, Reservation l = Reservation::NO_RESERVATION);
 
-	virtual bool event_triggered(void);
+	virtual bool event_triggered(bool poisoned);
 	virtual void print_info(FILE *f);
       };
     };
@@ -137,6 +137,7 @@ namespace LegionRuntime {
     public:
       CopyRequest(const Domain& _domain,
 		  OASByInst *_oas_by_inst,
+		  const Realm::ProfilingRequestSet& _prs,
 		  Event _before_copy,
 		  Event _after_copy,
 		  int _priority);
@@ -296,6 +297,7 @@ namespace LegionRuntime {
 
     CopyRequest::CopyRequest(const Domain& _domain,
 			     OASByInst *_oas_by_inst,
+			     const Realm::ProfilingRequestSet& _prs,
 			     Event _before_copy,
 			     Event _after_copy,
 			     int _priority)
@@ -426,16 +428,18 @@ namespace LegionRuntime {
       e.impl()->add_waiter(e.gen, this);
     }
 
-    bool DmaRequest::Waiter::event_triggered(void)
+    bool DmaRequest::Waiter::event_triggered(bool poisoned)
     {
-      log_dma.info("request %p triggered in state %d (lock = " IDFMT ")",
-		   req, req->state, current_lock.id);
+      log_dma.info("request %p triggered in state %d (lock = " IDFMT ") poison=%d",
+		   req, req->state, current_lock.id, poisoned);
 
+      // our locks are always shared, so release even when poisoned
       if(current_lock.exists()) {
 	current_lock.release();
 	current_lock = Reservation::NO_RESERVATION;
       }
 
+      assert(!poisoned);  // add cancellation path
       // this'll enqueue the DMA if it can, or wait on another event if it 
       //  can't
       req->check_readiness(false, queue);
@@ -1485,7 +1489,7 @@ namespace LegionRuntime {
         report_bytes(after_copy);
 #endif
 	if(after_copy.exists())
-	  get_runtime()->get_genevent_impl(after_copy)->trigger(after_copy.gen, gasnet_mynode());
+	  GenEventImpl::local_trigger(after_copy, false /*not poisoned*/);
       }
 #ifdef EVENT_GRAPH_TRACE
     public:
@@ -1773,10 +1777,10 @@ namespace LegionRuntime {
 	    Event merged = GenEventImpl::merge_events(events);
 
 	    // deferred trigger based on this merged event
-	    get_runtime()->get_genevent_impl(after_copy)->trigger(after_copy.gen, gasnet_mynode(), merged);
+	    GenEventImpl::deferred_trigger(after_copy, merged);
 	  } else {
 	    // no actual copies occurred, so manually trigger event ourselves
-	    get_runtime()->get_genevent_impl(after_copy)->trigger(after_copy.gen, gasnet_mynode());
+	    GenEventImpl::local_trigger(after_copy, false /*not poisoned*/);
 	  }
 	} else {
 	  if(events.size() > 0) {
@@ -2212,7 +2216,7 @@ namespace LegionRuntime {
             if(num_writes == 0) {
               // an empty dma - no need to send a fence - we can trigger the
               //  completion event here and save a message
-	      get_runtime()->get_genevent_impl(after_copy)->trigger(after_copy.gen, gasnet_mynode());
+	      GenEventImpl::local_trigger(after_copy, false /*not poisoned*/);
             } else {
 #ifdef DEBUG_REMOTE_WRITES
 	      printf("remote write fence: " IDFMT "/%d\n", after_copy.id, after_copy.gen);
@@ -2723,8 +2727,9 @@ namespace LegionRuntime {
 
       virtual ~CopyCompletionLogger(void) { }
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	assert(!poisoned); // TODO: how to deal with poison in logging?
 	log_timing_event(Processor::NO_PROC, event, COPY_END);
 	return true;
       }
@@ -2746,8 +2751,9 @@ namespace LegionRuntime {
 
         virtual ~CopyCompletionProfiler(void) { }
 
-        virtual bool event_triggered(void)
+        virtual bool event_triggered(bool poisoned)
         {
+	  assert(!poisoned) // TODO: how to deal with poison in profiling?
           register_copy_event(PROF_END_COPY);
           return true;
         }
@@ -3534,7 +3540,7 @@ namespace LegionRuntime {
 	      }
 
 	      // all done - we can trigger the event locally in this case
-	      get_runtime()->get_genevent_impl(after_copy)->trigger(after_copy.gen, gasnet_mynode());
+	      GenEventImpl::local_trigger(after_copy, false /*not poisoned*/);
               delete e;
 	      break;
 	    }
@@ -3611,7 +3617,7 @@ namespace LegionRuntime {
 	      if(rdma_count > 0) {
 		do_remote_fence(dst_mem, sequence_id, rdma_count, after_copy);
 	      } else {
-		get_runtime()->get_genevent_impl(after_copy)->trigger(after_copy.gen, gasnet_mynode());
+		GenEventImpl::local_trigger(after_copy, false /*not poisoned*/);
 	      }
               delete e;
 	      break;
@@ -3682,7 +3688,7 @@ namespace LegionRuntime {
 	      }
 
 	      // all done - we can trigger the event locally in this case
-	      get_runtime()->get_genevent_impl(after_copy)->trigger(after_copy.gen, gasnet_mynode());
+	      GenEventImpl::local_trigger(after_copy, false /*not poisoned*/);
 
 	      // also release the instance lock
 	      dst_impl->lock.release();
@@ -3867,6 +3873,17 @@ namespace LegionRuntime {
 		       Event wait_on,
 		       ReductionOpID redop_id, bool red_fold) const
     {
+      // call the new version with an empty profiling request set
+      return copy(srcs, dsts, Realm::ProfilingRequestSet(),
+		  wait_on, redop_id, red_fold);
+    }
+
+    Event Domain::copy(const std::vector<CopySrcDstField>& srcs,
+		       const std::vector<CopySrcDstField>& dsts,
+		       const Realm::ProfilingRequestSet &prs,
+		       Event wait_on,
+		       ReductionOpID redop_id, bool red_fold) const
+    {
       if(redop_id == 0) {
 	// not a reduction, so sort fields by src/dst mem pairs
 
@@ -3924,6 +3941,10 @@ namespace LegionRuntime {
 
 	log_dma.info("copy: %zd distinct src/dst mem pairs, is=" IDFMT "", oas_by_mem.size(), is_id);
 
+	// hmm...  don't really have a good plan for profiling if the copy splits up into
+	//  multiple src/dst pairs yet...
+	assert((oas_by_mem.size() == 1) || (prs.request_count() == 0));
+
 	for(OASByMem::const_iterator it = oas_by_mem.begin(); it != oas_by_mem.end(); it++) {
 	  Memory src_mem = it->first.first;
 	  Memory dst_mem = it->first.second;
@@ -3947,7 +3968,7 @@ namespace LegionRuntime {
 	    priority = 1;
 #endif
 
-	  CopyRequest *r = new CopyRequest(*this, oas_by_inst, 
+	  CopyRequest *r = new CopyRequest(*this, oas_by_inst, prs,
 					   wait_on, ev, priority);
 
 	  // ask which node should perform the copy
@@ -4082,6 +4103,11 @@ namespace LegionRuntime {
       assert(redop_id == 0);
 
       assert(0);
+    }
+
+    /*static*/ void Domain::cancel_copy(Event finish_event)
+    {
+      assert(0 && "fault injection not implemented yet");
     }
 
   };

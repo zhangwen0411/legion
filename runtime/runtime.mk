@@ -244,6 +244,9 @@ CC_FLAGS        += -Wall -Werror
 
 #CC_FLAGS += -DUSE_MASKED_COPIES
 
+# C++ exceptions used for stack unwinding
+CC_FLAGS	+= -DREALM_UNWIND_WITH_EXCEPTIONS -fnon-call-exceptions
+
 # Set the source files
 ifeq ($(strip $(SHARED_LOWLEVEL)),0)
 LOW_RUNTIME_SRC	+= $(LG_RT_DIR)/lowlevel.cc $(LG_RT_DIR)/lowlevel_disk.cc
@@ -255,11 +258,13 @@ LOW_RUNTIME_SRC += $(LG_RT_DIR)/activemsg.cc
 endif
 LOW_RUNTIME_SRC += $(LG_RT_DIR)/lowlevel_dma.cc
 GPU_RUNTIME_SRC +=
+LOW_RUNTIME_SRC += $(LG_RT_DIR)/realm/operation.cc
 else
 CC_FLAGS	+= -DSHARED_LOWLEVEL
 LOW_RUNTIME_SRC	+= $(LG_RT_DIR)/shared_lowlevel.cc 
 endif
 LOW_RUNTIME_SRC += $(LG_RT_DIR)/realm/logging.cc
+LOW_RUNTIME_SRC += $(LG_RT_DIR)/realm/profiling.cc
 
 # If you want to go back to using the shared mapper, comment out the next line
 # and uncomment the one after that

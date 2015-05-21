@@ -40,7 +40,7 @@ namespace LegionRuntime {
 
       virtual ~GPUJob(void) {}
 
-      virtual bool event_triggered(void) = 0;
+      virtual bool event_triggered(bool poisoned) = 0;
 
       virtual void print_info(FILE *f) = 0;
 
@@ -72,8 +72,7 @@ namespace LegionRuntime {
       {
         // If we have a finish event then trigger it
         if (finish_event.exists())
-	  get_runtime()->get_genevent_impl(finish_event)->
-            trigger(finish_event.gen, gasnet_mynode());
+	  GenEventImpl::local_trigger(finish_event, false /*not poisoned*/);
         // Destroy our event
         CHECK_CU( cuEventDestroy(complete_event) );
       }
@@ -89,11 +88,12 @@ namespace LegionRuntime {
       GPUTask(GPUProcessor *_gpu, Event _finish_event,
 	      Processor::TaskFuncID _func_id,
 	      const void *_args, size_t _arglen,
+	      const Realm::ProfilingRequestSet& _prs,
               int priority);
 
       virtual ~GPUTask(void);
 
-      virtual bool event_triggered(void);
+      virtual bool event_triggered(bool poisoned);
 
       virtual void print_info(FILE *f);
 
@@ -771,6 +771,7 @@ namespace LegionRuntime {
     GPUTask::GPUTask(GPUProcessor *_gpu, Event _finish_event,
 		     Processor::TaskFuncID _func_id,
 		     const void *_args, size_t _arglen,
+		     const Realm::ProfilingRequestSet& _prs,
                      int _priority)
       : GPUJob(_gpu, _finish_event), func_id(_func_id), 
                arglen(_arglen), priority(_priority)
@@ -788,8 +789,9 @@ namespace LegionRuntime {
       if(args) free(args);
     }
 
-    bool GPUTask::event_triggered(void)
+    bool GPUTask::event_triggered(bool poisoned)
     {
+      assert(!poisoned); // TODO - link to base Operation class
       log_gpu.info("gpu job %p now runnable", this);
       gpu->internal->enqueue_task(this);
 
@@ -895,8 +897,9 @@ namespace LegionRuntime {
 
       virtual ~GPUMemcpy(void) { }
     public:
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	assert(!poisoned); // TODO - cancel when poisoned
         log_gpu.info("gpu job %p now runnable", this);
         gpu->internal->enqueue_copy(this);
 
@@ -1118,8 +1121,9 @@ namespace LegionRuntime {
 	  mem_offset(_mem_offset), mask(_mask), elmt_size(_elmt_size), kind(_kind)
       {}
 
-      virtual bool event_triggered(void)
+      virtual bool event_triggered(bool poisoned)
       {
+	assert(!poisoned); // TODO: cancel if poisoned
         log_gpu.info("gpu job %p now runnable", this);
         gpu->internal->enqueue_copy(this);
 
@@ -1293,12 +1297,14 @@ namespace LegionRuntime {
 #ifndef EVENT_GRAPH_TRACE
       if(it != get_runtime()->task_table.end())
 	internal->enqueue_task(new GPUTask(this, Event::NO_EVENT,
-					  Processor::TASK_ID_PROCESSOR_INIT, 0, 0, 0));
+					   Processor::TASK_ID_PROCESSOR_INIT, 0, 0,
+					   Realm::ProfilingRequestSet(), 0));
 #else
       enclosing_stack.push_back(Event::NO_EVENT);
       if(it != get_runtime()->task_table.end())
         internal->enqueue_task(new GPUTask(this, Event::Impl::create_event(), 
-                                           Processor::TASK_ID_PROCESSOR_INIT, 0, 0, 0));
+                                           Processor::TASK_ID_PROCESSOR_INIT, 0, 0, 
+					   Realm::ProfilingRequestSet(), 0));
 #endif
 
       internal->create_gpu_thread(_stack_size);
@@ -1354,6 +1360,7 @@ namespace LegionRuntime {
 
     void GPUProcessor::spawn_task(Processor::TaskFuncID func_id,
 				  const void *args, size_t arglen,
+				  const Realm::ProfilingRequestSet& prs,
 				  //std::set<RegionInstanceUntyped> instances_needed,
 				  Event start_event, Event finish_event,
                                   int priority)
@@ -1362,7 +1369,7 @@ namespace LegionRuntime {
 		   func_id, start_event.id, start_event.gen, finish_event.id, finish_event.gen);
       if(func_id != 0) {
 	(new GPUTask(this, finish_event,
-		     func_id, args, arglen, priority))->run_or_wait(start_event);
+		     func_id, args, arglen, prs, priority))->run_or_wait(start_event);
       } else {
 	AutoHSLLock a(internal->mutex);
 	log_gpu.info("received shutdown request!");

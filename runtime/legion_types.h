@@ -23,6 +23,7 @@
 
 #include "legion_config.h"
 #include "lowlevel.h"
+#include "realm/profiling.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -90,7 +91,8 @@ namespace LegionRuntime {
       INIT_FUNC_ID          = LowLevel::Processor::TASK_ID_PROCESSOR_INIT,
       SHUTDOWN_FUNC_ID      = LowLevel::Processor::TASK_ID_PROCESSOR_SHUTDOWN,
       HLR_TASK_ID           = LowLevel::Processor::TASK_ID_FIRST_AVAILABLE,
-      TASK_ID_AVAILABLE     = (LowLevel::Processor::TASK_ID_FIRST_AVAILABLE+1),
+      PROFILE_TASK_ID       = (LowLevel::Processor::TASK_ID_FIRST_AVAILABLE+1),
+      TASK_ID_AVAILABLE     = (LowLevel::Processor::TASK_ID_FIRST_AVAILABLE+2),
     };
 
     // redop IDs - none used in HLR right now, but 0 isn't allowed
@@ -338,6 +340,9 @@ namespace LegionRuntime {
     typedef LowLevel::Machine::MemoryMemoryAffinity MemoryMemoryAffinity;
     typedef LowLevel::ElementMask::Enumerator Enumerator;
     typedef LowLevel::IndexSpace::FieldDataDescriptor FieldDataDescriptor;
+    typedef Realm::ProfilingResponse ProfilingResponse;
+    typedef Realm::ProfilingRequestSet ProfilingRequestSet;
+    namespace ProfilingMeasurements = Realm::ProfilingMeasurements;
     typedef ::legion_address_space_t AddressSpace;
     typedef ::legion_task_priority_t TaskPriority;
     typedef ::legion_color_t Color;

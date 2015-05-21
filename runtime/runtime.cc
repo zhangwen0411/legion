@@ -25,6 +25,7 @@
 #include "legion_spy.h"
 #include "legion_logging.h"
 #include "legion_profiling.h"
+#include "realm/profiling.h"
 #ifdef HANG_TRACE
 #include <signal.h>
 #include <execinfo.h>
@@ -14943,7 +14944,7 @@ namespace LegionRuntime {
     /*static*/ bool Runtime::separate_runtime_instances = false;
     /*static*/ bool Runtime::record_registration = false;
     /*sattic*/ bool Runtime::stealing_disabled = false;
-    /*static*/ bool Runtime::resilient_mode = false;
+    /*static*/ bool Runtime::resilient_mode = true; // opt out, not in
     /*static*/ bool Runtime::unsafe_launch = false;
     /*static*/ bool Runtime::dynamic_independence_tests = true;
     /*static*/ unsigned Runtime::shutdown_counter = 0;
@@ -15042,10 +15043,18 @@ namespace LegionRuntime {
           continue;					\
         } } while(0)
 
-#define BOOL_ARG(argname, varname) do { \
-        if(!strcmp((argv)[i], argname)) {		\
-          varname = true;				\
-          continue;					\
+	// for boolean arguments, accept "on" or "off" as a following value
+	// if not present, assume "on"
+#define BOOL_ARG(argname, varname) do {			    \
+        if(!strcmp((argv)[i], argname)) {	  	    \
+	  if((i+1 < argc) && !strcmp((argv)[i+1], "on")) {  \
+	    varname = true; i++; continue;		    \
+	  }						    \
+	  if((i+1 < argc) && !strcmp((argv)[i+1], "off")) { \
+	    varname = false; i++; continue;		    \
+	  }						    \
+	  varname = true;				    \
+          continue;					    \
         } } while(0)
 
         // Set these values here before parsing the input arguments
@@ -15742,6 +15751,7 @@ namespace LegionRuntime {
       table[INIT_FUNC_ID]          = Runtime::initialize_runtime;
       table[SHUTDOWN_FUNC_ID]      = Runtime::shutdown_runtime;
       table[HLR_TASK_ID]           = Runtime::high_level_runtime_task;
+      table[PROFILE_TASK_ID]       = Runtime::profiler_feedback_task;
     }
 
     //--------------------------------------------------------------------------
@@ -16342,6 +16352,20 @@ namespace LegionRuntime {
         default:
           assert(false); // should never get here
       }
+    }
+
+    //--------------------------------------------------------------------------
+    /*static*/ void Runtime::profiler_feedback_task(
+                                  const void *args, size_t arglen, Processor p)
+    //--------------------------------------------------------------------------
+    {
+      Realm::ProfilingResponse pr(args, arglen);
+
+      Operation::ProfileResponseArgs *rargs = 
+                         (Operation::ProfileResponseArgs *)(pr.user_data());
+      assert(pr.user_data_size() == sizeof(Operation::ProfileResponseArgs));
+
+      rargs->op->profiler_feedback(rargs->gen, rargs->attempt, pr);
     }
 
 #ifdef TRACE_ALLOCATION

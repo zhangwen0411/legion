@@ -20,6 +20,7 @@
 #include "legion_trace.h"
 #include "legion_logging.h"
 #include "legion_profiling.h"
+#include "realm/profiling.h"
 #include <algorithm>
 
 // A little bit of a hack for now for profiling
@@ -5083,8 +5084,30 @@ namespace LegionRuntime {
         additional_procs.insert(executing_processor);
         launch_processor = runtime->find_processor_group(additional_procs);
       }
+
+      // assemble a profiling request that will, at the very least, tell us
+      //  when the task finishes and how it turned out
+      ProfilingRequestSet prs;
+      if(profiling_feedback_required) 
+      {
+	Operation::ProfileResponseArgs rargs;
+	rargs.op = this;
+	rargs.gen = gen;
+        // so that we don't get confused by feedback from a previous attempt
+	rargs.attempt = 1;  
+#ifdef SPECIALIZED_UTIL_PROCS
+	Processor util = runtime->get_cleanup_proc(executing_processor);
+#else
+	Processor util = runtime->find_utility_group();
+#endif
+	prs.add_request(util, PROFILE_TASK_ID, &rargs, sizeof(rargs))
+	  .add_measurement<ProfilingMeasurements::OperationStatus>();
+      }
+
       Event task_launch_event = launch_processor.spawn(low_id, &proxy_this,
-                            sizeof(proxy_this), start_condition, task_priority);
+						       sizeof(proxy_this), prs, 
+						       start_condition, 
+                                                       task_priority);
       // Finish the chaining optimization if we're doing it
       if (perform_chaining_optimization)
         chain_complete_event.trigger(task_launch_event);
@@ -5258,23 +5281,52 @@ namespace LegionRuntime {
 #ifdef LEGION_PROF
       LegionProf::register_event(get_unique_task_id(), PROF_END_EXECUTION);
 #endif
-      
-      // See if we want to move the rest of this computation onto
-      // the utility processor
+
+      // if we've requested profiling data, we'll trigger completion when
+      //  it arrives - if not, go ahead and trigger completion now
+      if(!profiling_feedback_required) {
+	// See if we want to move the rest of this computation onto
+	// the utility processor
 #ifdef SPECIALIZED_UTIL_PROCS
-      Processor util = runtime->get_cleanup_proc(executing_processor);
+	Processor util = runtime->get_cleanup_proc(executing_processor);
 #else
-      Processor util = runtime->find_utility_group();
+	Processor util = runtime->find_utility_group();
 #endif
-      if (util != executing_processor)
-      {
-        PostEndArgs post_end_args;
-        post_end_args.hlr_id = HLR_POST_END_ID;
-        post_end_args.proxy_this = this;
-        util.spawn(HLR_TASK_ID, &post_end_args, sizeof(post_end_args));
+	if (util != executing_processor)
+	{
+	  PostEndArgs post_end_args;
+	  post_end_args.hlr_id = HLR_POST_END_ID;
+	  post_end_args.proxy_this = this;
+	  util.spawn(HLR_TASK_ID, &post_end_args, sizeof(post_end_args));
+	}
+	else
+	  post_end_task();
       }
-      else
-        post_end_task();
+    }
+
+    //--------------------------------------------------------------------------
+    void SingleTask::profiler_feedback(GenerationID gen_profiled, 
+                                       int attempt_profiled,
+				       const ProfilingResponse& pr)
+    //--------------------------------------------------------------------------
+    {
+      // first, make sure this is for the right generation
+      //assert(gen_profiled == gen);
+
+      // get the operation status from the profiling response
+      ProfilingMeasurements::OperationStatus *status = 
+        pr.get_measurement<ProfilingMeasurements::OperationStatus>();
+      assert(status != 0);
+
+      printf("profiling feedback received for %p/%d(%d) (%d) status = %d\n",
+	     this, gen_profiled, gen, attempt_profiled, status->result);
+
+      // for now, just verify that it completed successfully 
+      // and perform the post-end task work
+      assert(status->result == 
+          ProfilingMeasurements::OperationStatus::COMPLETED_SUCCESSFULLY);
+
+      post_end_task();
     }
 
     //--------------------------------------------------------------------------

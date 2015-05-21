@@ -1881,6 +1881,8 @@ namespace LegionRuntime {
                           const void *args, size_t arglen, Processor p);
       static void high_level_runtime_task(
                           const void *args, size_t arglen, Processor p);
+      static void profiler_feedback_task(
+			  const void *args, size_t arglen, Processor p);
     protected:
       // Internal runtime methods invoked by the above static methods
       // after the find the right runtime instance to call
