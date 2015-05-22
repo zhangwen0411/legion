@@ -16,4 +16,9 @@ matrix:
   exclude:
     - os: osx
       compiler: gcc
+before_install:
+  - if [ "$(uname)" = "Linux" -a "$CXX" = "g++" ]; then sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y; fi
+  - if [ "$(uname)" = "Linux" -a "$CXX" = "g++" ]; then sudo apt-get update -qq; fi
+  - if [ "$(uname)" = "Linux" -a "$CXX" = "g++" ]; then sudo apt-get install -qq g++-4.8; fi
+  - if [ "$(uname)" = "Linux" -a "$CXX" = "g++" ]; then export CXX="g++-4.8" CC="gcc-4.8"; fi
 script: ./language/travis.py
