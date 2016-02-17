@@ -45,6 +45,9 @@ SLIB_SHAREDLLR  := libsharedllr.a
 LEGION_LIBS     := -L. -llegion -lsharedllr
 endif
 
+# use boost to allow serialization during debug
+BOOST_LIB       := -lboost_iostreams -lboost_serialization
+
 # Handle some of the common machines we frequent
 
 # machine architecture (generally "native" unless cross-compiling)
@@ -385,7 +388,7 @@ all: $(OUTFILE)
 # If we're using the general low-level runtime we have to link with nvcc
 $(OUTFILE) : $(GEN_OBJS) $(GEN_GPU_OBJS) $(SLIB_LEGION) $(SLIB_REALM) $(SLIB_SHAREDLLR)
 	@echo "---> Linking objects into one binary: $(OUTFILE)"
-	$(CXX) -o $(OUTFILE) $(GEN_OBJS) $(GEN_GPU_OBJS) $(LD_FLAGS) $(LEGION_LIBS) $(LEGION_LD_FLAGS) $(GASNET_FLAGS)
+	$(CXX) -o $(OUTFILE) $(GEN_OBJS) $(GEN_GPU_OBJS) $(LD_FLAGS) $(LEGION_LIBS) $(BOOST_LIB) $(LEGION_LD_FLAGS) $(GASNET_FLAGS)
 
 $(SLIB_LEGION) : $(HIGH_RUNTIME_OBJS) $(MAPPER_OBJS)
 	rm -f $@

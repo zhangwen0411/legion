@@ -25,6 +25,12 @@
 #include "legion_types.h"
 #include "legion_constraint.h"
 
+#include <boost/serialization/access.hpp>
+#include <boost/archive/binary_oarchive.hpp>
+#include <boost/archive/binary_iarchive.hpp>
+#include <boost/iostreams/device/back_inserter.hpp>
+#include <boost/iostreams/stream.hpp>
+
 // temporary helper macro to turn link errors into runtime errors
 #define UNIMPLEMENTED_METHOD(retval) do { assert(0); return retval; } while(0)
 
@@ -73,6 +79,15 @@ namespace LegionRuntime {
     private:
       IndexSpaceID id;
       IndexTreeID tid;
+    private:
+      // Enable serialization
+      friend class boost::serialization::access;
+      template<class Archive>
+      void serialize(Archive & ar, const unsigned int version)
+      {
+        ar & BOOST_SERIALIZATION_NVP(id);
+        ar & BOOST_SERIALIZATION_NVP(tid);
+      }
     };
 
     /**
@@ -103,6 +118,15 @@ namespace LegionRuntime {
     public:
       IndexPartitionID id;
       IndexTreeID tid;
+    private:
+      // Enable serialization
+      friend class boost::serialization::access;
+      template<class Archive>
+      void serialize(Archive & ar, const unsigned int version)
+      {
+        ar & BOOST_SERIALIZATION_NVP(id);
+        ar & BOOST_SERIALIZATION_NVP(tid);
+      }
     };
 
     /**
@@ -134,6 +158,14 @@ namespace LegionRuntime {
       inline bool exists(void) const { return (id != 0); }
     private:
       FieldSpaceID id;
+    private:
+      // Enable serialization
+      friend class boost::serialization::access;
+      template<class Archive>
+      void serialize(Archive & ar, const unsigned int version)
+      {
+        ar & BOOST_SERIALIZATION_NVP(id);
+      }
     };
 
     /**
@@ -175,6 +207,16 @@ namespace LegionRuntime {
       RegionTreeID tree_id;
       IndexSpace index_space;
       FieldSpace field_space;
+    private:
+      // Enable serialization
+      friend class boost::serialization::access;
+      template<class Archive>
+      void serialize(Archive & ar, const unsigned int version)
+      {
+        ar & BOOST_SERIALIZATION_NVP(tree_id);
+        ar & BOOST_SERIALIZATION_NVP(index_space);
+        ar & BOOST_SERIALIZATION_NVP(field_space);
+      }
     };
 
     /**
@@ -218,6 +260,15 @@ namespace LegionRuntime {
       RegionTreeID tree_id;
       IndexPartition index_partition;
       FieldSpace field_space;
+      // Enable serialization
+      friend class boost::serialization::access;
+      template<class Archive>
+      void serialize(Archive & ar, const unsigned int version)
+      {
+        ar & BOOST_SERIALIZATION_NVP(tree_id);
+        ar & BOOST_SERIALIZATION_NVP(index_partition);
+        ar & BOOST_SERIALIZATION_NVP(field_space);
+      }
     };
 
     //==========================================================================
