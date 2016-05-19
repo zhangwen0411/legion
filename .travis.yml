@@ -37,38 +37,38 @@ before_install:
 script:
   - ./language/travis.py
   - |
-    make -s -C examples/00_hello_world LG_RT_DIR=../../runtime clean
-    make -s -C examples/00_hello_world LG_RT_DIR=../../runtime -j2
+    make -s -C examples/00_hello_world clean
+    make -s -C examples/00_hello_world -j2
     examples/00_hello_world/hello_world
-    make -s -C examples/01_tasks_and_futures LG_RT_DIR=../../runtime
+    make -s -C examples/01_tasks_and_futures
     examples/01_tasks_and_futures/tasks_and_futures
-    make -s -C examples/02_index_tasks LG_RT_DIR=../../runtime
+    make -s -C examples/02_index_tasks
     examples/02_index_tasks/index_tasks
-    make -s -C examples/03_global_vars LG_RT_DIR=../../runtime
+    make -s -C examples/03_global_vars
     examples/03_global_vars/global_vars
-    make -s -C examples/04_logical_regions LG_RT_DIR=../../runtime
+    make -s -C examples/04_logical_regions
     examples/04_logical_regions/logical_regions
-    make -s -C examples/05_physical_regions LG_RT_DIR=../../runtime
+    make -s -C examples/05_physical_regions
     examples/05_physical_regions/physical_regions
-    make -s -C examples/06_privileges LG_RT_DIR=../../runtime
+    make -s -C examples/06_privileges
     examples/06_privileges/privileges
-    make -s -C examples/07_partitioning LG_RT_DIR=../../runtime
+    make -s -C examples/07_partitioning
     examples/07_partitioning/partitioning
-    make -s -C examples/08_multiple_partitioning LG_RT_DIR=../../runtime
+    make -s -C examples/08_multiple_partitioning
     examples/08_multiple_partitioning/multiple_partitioning
-    make -s -C examples/09_custom_mapper LG_RT_DIR=../../runtime
+    make -s -C examples/09_custom_mapper
     examples/09_custom_mapper/custom_mapper
-    make -s -C examples/full_circuit LG_RT_DIR=../../runtime
+    make -s -C examples/full_circuit
     examples/full_circuit/ckt_sim
-    make -s -C examples/full_ghost LG_RT_DIR=../../runtime
+    make -s -C examples/full_ghost
     examples/full_ghost/ghost -ll:cpu 4
   - |
     if [ $DEBUG -eq 0 ]; then
-      make -s -C test/realm LG_RT_DIR=../../runtime DEBUG=0 SHARED_LOWLEVEL=0 USE_CUDA=0 USE_GASNET=0 clean
-      make -s -C test/realm LG_RT_DIR=../../runtime DEBUG=0 SHARED_LOWLEVEL=0 USE_CUDA=0 USE_GASNET=0 run_all
+      make -s -C test/realm USE_CUDA=0 USE_GASNET=0 clean
+      make -s -C test/realm USE_CUDA=0 USE_GASNET=0 run_all
     fi
   - |
     if [ $DEBUG -eq 0 ]; then
-      make -s -C test/performance/realm LG_RT_DIR=../../../runtime SHARED_LOWLEVEL=0 clean_all
-      make -s -C test/performance/realm LG_RT_DIR=../../../runtime SHARED_LOWLEVEL=0 run_all
+      make -s -C test/performance/realm clean_all
+      make -s -C test/performance/realm run_all
     fi
