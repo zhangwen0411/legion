@@ -17,38 +17,28 @@
 
 import os, platform, subprocess
 
-def install_dependencies():
-    env = dict(os.environ.iteritems())
+def install_terra():
+    platform_name = platform.system() if platform.system() != 'Darwin' else 'OSX'
+    base_url = 'https://github.com/zdevito/terra/releases/download/release-2016-03-25'
+    terra_tarball = 'terra-%s-x86_64-332a506.zip' % platform_name
+    terra_url = '%s/%s' % (base_url, terra_tarball)
+    terra_dir = os.path.abspath(os.path.splitext(terra_tarball)[0])
 
-    if platform.system() == 'Darwin':
-        # root_url = 'http://llvm.org/releases/3.5.2'
-        root_url = 'http://legion.stanford.edu/~eslaught/llvm-deb-mirror/releases/3.5.2'
-        clang_tarball = 'clang+llvm-3.5.2-x86_64-apple-darwin.tar.xz'
-        clang_dir = os.path.abspath('clang+llvm-3.5.2-x86_64-apple-darwin')
+    shasums = {'Linux': '6a1c29a061c502aaf69d39c6a0f54702dea3ff60', 'Darwin': '8357b07b0bed33eac1355b55e135196119ec83ba'}
 
-        print('%s/%s' % (root_url, clang_tarball))
-        subprocess.check_call(
-            ['curl', '-O', '%s/%s' % (root_url, clang_tarball)])
-        shasum = subprocess.Popen(['shasum', '-c'], stdin=subprocess.PIPE)
-        shasum.communicate(
-            '547d9a359258ce918750fd8647cd6e1b47feaa51  %s' % clang_tarball)
-        assert shasum.wait() == 0
-        subprocess.check_call(['tar', 'xfJ', clang_tarball])
+    subprocess.check_call(['curl', '-L', '-O', terra_url])
+    shasum = subprocess.Popen(['shasum', '-c'], stdin=subprocess.PIPE)
+    shasum.communicate(
+        '%s  %s' % (shasums[platform.system()], terra_tarball))
+    assert shasum.wait() == 0
+    subprocess.check_call(['unzip', terra_tarball])
 
-        env.update({
-            'PATH': ':'.join(
-                [os.path.join(clang_dir, 'bin'), os.environ['PATH']]),
-            'DYLD_LIBRARY_PATH': ':'.join(
-                [os.path.join(clang_dir, 'lib')] +
-                ([os.environ['DYLD_LIBRARY_PATH']]
-                 if 'DYLD_LIBRARY_PATH' in os.environ else [])),
-        })
+    return terra_dir
 
-    return env
-
-def test(root_dir, debug, env):
+def test(root_dir, terra_dir, debug, env):
     subprocess.check_call(
-        ['time', './install.py', '-j', '2'] + (['--debug'] if debug else []),
+        ['time', './install.py', '-j', '2', '--with-terra', terra_dir] +
+        (['--debug'] if debug else []),
         env = env,
         cwd = root_dir)
     subprocess.check_call(
@@ -58,16 +48,11 @@ def test(root_dir, debug, env):
 
 if __name__ == '__main__':
     root_dir = os.path.realpath(os.path.dirname(__file__))
-    legion_dir = os.path.dirname(root_dir)
-    runtime_dir = os.path.join(legion_dir, 'runtime')
+    terra_dir = install_terra()
 
-    env = install_dependencies()
-    env.update({
-        'LG_RT_DIR': runtime_dir,
-        'LUAJIT_URL': 'http://legion.stanford.edu/~eslaught/mirror/LuaJIT-2.0.4.tar.gz',
-    })
     # reduce output spewage by default
+    env = dict(os.environ.iteritems())
     if 'MAKEFLAGS' not in env:
         env['MAKEFLAGS'] = 's'
 
-    test(root_dir, env['DEBUG'], env)
+    test(root_dir, terra_dir, env['DEBUG'], env)
