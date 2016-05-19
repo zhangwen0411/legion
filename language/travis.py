@@ -31,7 +31,7 @@ def install_terra():
     shasum.communicate(
         '%s  %s' % (shasums[platform.system()], terra_tarball))
     assert shasum.wait() == 0
-    subprocess.check_call(['unzip', terra_tarball])
+    subprocess.check_call(['unzip', '-q', terra_tarball])
 
     return terra_dir
 
