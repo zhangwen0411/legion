@@ -34,8 +34,8 @@ local default_options = {
   ["vectorize"] = true,
   ["validate"] = true,
   ["task-inlines"] = true,
-  ["flow"] = false,
-  ["flow-spmd"] = false,
+  ["flow"] = true,
+  ["flow-spmd"] = true,
   ["flow-spmd-shardsize"] = 1,
 }
 
