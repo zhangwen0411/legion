@@ -566,8 +566,9 @@ function type_check.expr_index_access(cx, node)
       span = node.span,
     }
   elseif std.is_cross_product(value_type) then
-    if not std.validate_implicit_cast(index_type, int) then
-      log.error(node, "type mismatch: expected " .. tostring(int) .. " but got " .. tostring(index_type))
+    local color_type = value_type:partition():colors().index_type
+    if not std.validate_implicit_cast(index_type, color_type) then
+      log.error(node, "type mismatch: expected " .. tostring(color_type) .. " but got " .. tostring(index_type))
     end
 
     local partition = value_type:partition()
