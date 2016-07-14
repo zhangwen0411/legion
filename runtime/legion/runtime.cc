@@ -670,19 +670,22 @@ namespace Legion {
 #ifdef DEBUG_LEGION
       assert(is_owner());
 #endif
-      Serializer rez;
-      {
-        rez.serialize(did);
-        RezCheck z(rez);
-        rez.serialize(result_size);
-        rez.serialize(result,result_size);
-      }
       // Need to hold the lock when reading the set of remote spaces
       AutoLock gc(gc_lock,1,false/*exclusive*/);
-      for (std::set<AddressSpaceID>::const_iterator it = 
-            registered_waiters.begin(); it != registered_waiters.end(); it++)
+      if (!registered_waiters.empty())
       {
-        runtime->send_future_result(*it, rez); 
+        Serializer rez;
+        {
+          rez.serialize(did);
+          RezCheck z(rez);
+          rez.serialize(result_size);
+          rez.serialize(result,result_size);
+        }
+        for (std::set<AddressSpaceID>::const_iterator it = 
+              registered_waiters.begin(); it != registered_waiters.end(); it++)
+        {
+          runtime->send_future_result(*it, rez); 
+        }
       }
     }
 
@@ -13152,7 +13155,7 @@ namespace Legion {
       if (pid == 0)
       {
         log_run.error("ERROR: ProjectionID zero is reserved.\n");
-#ifdef DEBUG_HIGH_LEVEl
+#ifdef DEBUG_LEGION
         assert(false);
 #endif
         exit(ERROR_RESERVED_PROJECTION_ID);
@@ -13169,7 +13172,7 @@ namespace Legion {
       {
         log_run.error("ERROR: ProjectionID %d has already been used in "
                                     "the region projection table\n", pid);
-#ifdef DEBUG_HIGH_LEVEl
+#ifdef DEBUG_LEGION
         assert(false);
 #endif
         exit(ERROR_DUPLICATE_PROJECTION_ID);
@@ -13195,7 +13198,7 @@ namespace Legion {
       if (pid == 0)
       {
         log_run.error("ERROR: ProjectionID zero is reserved.\n");
-#ifdef DEBUG_HIGH_LEVEl
+#ifdef DEBUG_LEGION
         assert(false);
 #endif
         exit(ERROR_RESERVED_PROJECTION_ID);
@@ -13208,7 +13211,7 @@ namespace Legion {
       {
         log_run.error("ERROR: ProjectionID %d has already been used in "
                                     "the region projection table\n", pid);
-#ifdef DEBUG_HIGH_LEVEl
+#ifdef DEBUG_LEGION
         assert(false);
 #endif
         exit(ERROR_DUPLICATE_PROJECTION_ID);
@@ -13755,13 +13758,15 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     void Runtime::process_mapper_message(Processor target, MapperID map_id,
-                     Processor source, const void *message, size_t message_size)
+                                     Processor source, const void *message,
+                                     size_t message_size, unsigned message_kind)
     //--------------------------------------------------------------------------
     {
       if (is_local(target))
       {
         Mapper::MapperMessage message_args;
         message_args.sender = source;
+        message_args.kind = message_kind;
         message_args.message = message;
         message_args.size = message_size;
         message_args.broadcast = false;
@@ -13776,6 +13781,7 @@ namespace Legion {
           rez.serialize(target);
           rez.serialize(map_id);
           rez.serialize(source);
+          rez.serialize(message_kind);
           rez.serialize(message_size);
           rez.serialize(message, message_size);
         }
@@ -13785,7 +13791,8 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     void Runtime::process_mapper_broadcast(MapperID map_id, Processor source, 
-                 const void *message, size_t message_size, int radix, int index)
+                                    const void *message, size_t message_size, 
+                                    unsigned message_kind, int radix, int index)
     //--------------------------------------------------------------------------
     {
       // First forward the message onto any remote nodes
@@ -13805,6 +13812,7 @@ namespace Legion {
           RezCheck z(rez);
           rez.serialize(map_id);
           rez.serialize(source);
+          rez.serialize(message_kind);
           rez.serialize(radix);
           rez.serialize(offset);
           rez.serialize(message_size);
@@ -13821,6 +13829,7 @@ namespace Legion {
       }
       Mapper::MapperMessage message_args;
       message_args.sender = source;
+      message_args.kind = message_kind;
       message_args.message = message;
       message_args.size = message_size;
       message_args.broadcast = true;
@@ -15411,11 +15420,14 @@ namespace Legion {
       derez.deserialize(map_id);
       Processor source;
       derez.deserialize(source);
+      unsigned message_kind;
+      derez.deserialize(message_kind);
       size_t message_size;
       derez.deserialize(message_size);
       const void *message = derez.get_current_pointer();
       derez.advance_pointer(message_size);
-      process_mapper_message(target, map_id, source, message, message_size);
+      process_mapper_message(target, map_id, source, message, 
+                             message_size, message_kind);
     }
 
     //--------------------------------------------------------------------------
@@ -15427,6 +15439,8 @@ namespace Legion {
       derez.deserialize(map_id);
       Processor source;
       derez.deserialize(source);
+      unsigned message_kind;
+      derez.deserialize(message_kind);
       int radix;
       derez.deserialize(radix);
       int index;
@@ -15436,7 +15450,7 @@ namespace Legion {
       const void *message = derez.get_current_pointer();
       derez.advance_pointer(message_size);
       process_mapper_broadcast(map_id, source, message, 
-                               message_size, radix, index);
+                               message_size, message_kind, radix, index);
     }
 
     //--------------------------------------------------------------------------
