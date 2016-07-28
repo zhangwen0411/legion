@@ -23,6 +23,8 @@
 #include "lowlevel.h"
 #include "utilities.h"
 
+#include "RTree.h"
+
 #ifdef SHARED_LOWLEVEL
 #define USE_LEGION_CROSS_PRODUCT 1
 #else
@@ -837,6 +839,114 @@ extract_domains_structured(HighLevelRuntime *runtime,
   }
 }
 
+// --- START: structured shallow cross product with RTree. ---
+
+struct shallow_cp_ctx {
+  size_t lhs_idx;
+  const std::vector<IndexSpace> &rhs;
+  legion_terra_index_space_list_list_t &result;
+
+  shallow_cp_ctx(const std::vector<IndexSpace> &_rhs,
+                 legion_terra_index_space_list_list_t &_result)
+    : lhs_idx(0), rhs(_rhs), result(_result) { }
+};
+
+bool add_shallow_result(size_t rhs_idx, void *_ctx)
+{
+  shallow_cp_ctx *ctx = static_cast<shallow_cp_ctx *>(_ctx);
+  assign_list_list(ctx->result, ctx->lhs_idx, rhs_idx, CObjectWrapper::wrap(ctx->rhs[rhs_idx]));
+  // std::cout << "foo: " << ctx->lhs_idx << ", " << rhs_idx << std::endl;
+  return true;
+}
+
+template<int DIM>
+static void
+get_rect_for_ispace(HighLevelRuntime *runtime,
+                    Context ctx,
+                    const IndexSpace &ispace,
+                    coord_t a_min[DIM],
+                    coord_t a_max[DIM])
+{
+  Domain domain = runtime->get_index_space_domain(ctx, ispace);
+  Rect<DIM> rect = domain.get_rect<DIM>();
+  rect.lo.to_array(a_min);
+  rect.hi.to_array(a_max);
+}
+
+template<int DIM>
+static void
+create_cross_product_shallow_structured_tree(HighLevelRuntime *runtime,
+                                        Context ctx,
+                                        const std::vector<IndexSpace> &lhs,
+                                        const std::vector<IndexSpace> &rhs,
+                                        legion_terra_index_space_list_list_t &result)
+{
+  RTree<size_t, coord_t, DIM> rtree;
+  for (size_t j = 0; j < rhs.size(); j++) {
+    coord_t a_min[DIM], a_max[DIM];
+    get_rect_for_ispace<DIM>(runtime, ctx, rhs[j], a_min, a_max);
+    rtree.Insert(a_min, a_max, j);
+  }
+
+  // std::cout << "foo: start tree" << std::endl;
+  shallow_cp_ctx shallow_ctx(rhs, result);
+  for (size_t i = 0; i < lhs.size(); i++) {
+    coord_t a_min[DIM], a_max[DIM];
+    get_rect_for_ispace<DIM>(runtime, ctx, lhs[i], a_min, a_max);
+    shallow_ctx.lhs_idx = i;
+    rtree.Search(a_min, a_max, add_shallow_result, &shallow_ctx);
+  }
+  // std::cout << "foo: end tree" << std::endl;
+}
+// --- END: structured shallow cross product with RTree. ---
+
+// --- START: structured shallow cross product on Rects. ---
+template<int DIM>
+static void
+extract_rect_structured(HighLevelRuntime *runtime,
+                           Context ctx,
+                           const std::vector<IndexSpace> &ispaces,
+                           std::vector<Rect<DIM> >& rects)
+{
+  assert(rects.empty());
+  rects.reserve(ispaces.size());
+  for (size_t i = 0; i < ispaces.size(); i++) {
+    const IndexSpace &ispace = ispaces[i];
+    // Doesn't currently handle structured index spaces with multiple domains.
+    assert(!runtime->has_multiple_domains(ctx, ispace));
+    Domain domain = runtime->get_index_space_domain(ctx, ispace);
+    rects.push_back(domain.get_rect<DIM>());
+  }
+}
+
+template<int DIM>
+static void
+create_cross_product_shallow_structured_rects(HighLevelRuntime *runtime,
+                                        Context ctx,
+                                        const std::vector<IndexSpace> &lhs,
+                                        const std::vector<IndexSpace> &rhs,
+                                        legion_terra_index_space_list_list_t &result)
+{
+  std::vector<Rect<DIM> > lh_rects, rh_rects;
+  extract_rect_structured<DIM>(runtime, ctx, lhs, lh_rects);
+  extract_rect_structured<DIM>(runtime, ctx, rhs, rh_rects);
+
+  // std::cout << "foo: start rect" << std::endl;
+  for (size_t i = 0; i < lhs.size(); i++) {
+    Rect<DIM> lh_rect = lh_rects[i];
+    for (size_t j = 0; j < rhs.size(); j++) {
+      Rect<DIM> rh_rect = rh_rects[j];
+      if (lh_rect.overlaps(rh_rect)) {
+        assign_list_list(result, i, j, CObjectWrapper::wrap(rhs[j]));
+        // std::cout << "foo: " << i << ", " << j << std::endl;
+      }
+    }
+  }
+  // std::cout << "foo: end rect" << std::endl;
+}
+// --- END: structured shallow cross product on Rects. ---
+
+
 // Takes the "shallow" cross product between lists of structured index spaces
 // `lhs` and `rhs`.  Specifically, if `lhs[i]` and `rhs[j]` intersect,
 // `result[i][j]` is populated with `rhs[j]`.
@@ -847,10 +957,19 @@ create_cross_product_shallow_structured(HighLevelRuntime *runtime,
                                         const std::vector<IndexSpace> &rhs,
                                         legion_terra_index_space_list_list_t &result)
 {
+  // RTREE
+  // create_cross_product_shallow_structured_tree<2>(runtime, ctx, lhs, rhs, result);
+  // return;
+
+  // RECT
+  create_cross_product_shallow_structured_rects<2>(runtime, ctx, lhs, rhs, result);
+  return;
+
   std::vector<Domain> lh_domains, rh_domains;
   extract_domains_structured(runtime, ctx, lhs, lh_domains);
   extract_domains_structured(runtime, ctx, rhs, rh_domains);
 
+  // std::cout << "foo: start" << std::endl;
   for (size_t i = 0; i < lhs.size(); i++) {
     Domain lh_domain = lh_domains[i];
     for (size_t j = 0; j < rhs.size(); j++) {
@@ -858,9 +977,11 @@ create_cross_product_shallow_structured(HighLevelRuntime *runtime,
       if (lh_domain.intersection(rh_domain).get_volume() > 0) {
         // Intersection isn't empty.
         assign_list_list(result, i, j, CObjectWrapper::wrap(rhs[j]));
+        // std::cout << "foo: " << i << ", " << j << std::endl;
       }
     }
   }
+  // std::cout << "foo: end" << std::endl;
 }
 
 // Takes the shallow cross product between lists of unstructured index spaces.
