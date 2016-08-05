@@ -4528,6 +4528,26 @@ function codegen.expr_list_range(cx, node)
     expr_type)
 end
 
+local function make_mapping_call(mapping, p, i, domain, ispace_type)
+  -- TODO(zhangwen): more asserts about match between `domain` and `ispace_type`?
+  if not mapping then return `i end
+
+  assert(std.is_ispace(ispace_type))
+  local index_type = ispace_type.index_type
+  assert(std.is_index_type(index_type))
+
+  if index_type.dim == 0 then
+    return `(mapping(p, i))
+  end
+
+  local get_rect = c["legion_domain_get_rect_" .. index_type.dim .. "d"]
+  assert(get_rect)
+  return quote
+    var rect = [get_rect](domain)
+    in mapping(p, i, [index_type.from_point](rect.lo), [index_type.from_point](rect.hi))
+  end
+end
+
 function codegen.expr_list_ispace(cx, node)
   local ispace_type = std.as_read(node.ispace.expr_type)
   local ispace = codegen.expr(cx, node.ispace):read(cx, ispace_type)
@@ -4537,7 +4557,8 @@ function codegen.expr_list_ispace(cx, node)
   local result_len = terralib.newsymbol(uint64, "result_len")
 
   -- Construct AST that populates the `result` list with indices from `ispace`.
-  --
+
+  local ispace_domain = terralib.newsymbol(c.legion_domain_t, "ispace_domain")
   -- Loop variable: `for p in ispace do`
   local bound
   if node.ispace:is(ast.typed.expr.ID) then
@@ -4545,16 +4566,18 @@ function codegen.expr_list_ispace(cx, node)
   else
     bound = std.newsymbol(ispace_type)
   end
-  local p_symbol = std.newsymbol(
-    ispace_type.index_type(bound),
-    "p")
+  local p_symbol = std.newsymbol(ispace_type.index_type(bound), "p")
   -- Index in list: `result[i] = p; i += 1`.
   local i = terralib.newsymbol(int, "i")
 
   local loop_body = ast.typed.stat.Internal {
     actions = quote
-      regentlib.assert((i >= 0) and (i < [result_len]), "list index out of bounds in list_ispace")
-      [expr_type:data(result)][ [i] ] = [p_symbol:getsymbol()];
+      var curr_index =
+        [make_mapping_call(node.mapping, p_symbol:getsymbol(), i, ispace_domain, ispace_type)];
+      -- TODO(zhangwen): assert that `curr_index` hasn't been used.
+      regentlib.assert((curr_index >= 0) and (curr_index < [result_len]),
+        "list index out of bounds in list_ispace")
+      [expr_type:data(result)][curr_index] = [p_symbol:getsymbol()]
       [i] = [i] + 1
     end,
     annotations = ast.default_annotations(),
@@ -4579,8 +4602,8 @@ function codegen.expr_list_ispace(cx, node)
     -- Currently doesn't support index spaces with multiple domains.
     regentlib.assert(not c.legion_index_space_has_multiple_domains([cx.runtime], [ispace.value].impl),
       "list_ispace doesn't support index spaces with multiple domains")
-    var ispace_domain = c.legion_index_space_get_domain([cx.runtime], [ispace.value].impl)
-    var [result_len] = c.legion_domain_get_volume(ispace_domain)
+    var [ispace_domain] = c.legion_index_space_get_domain([cx.runtime], [ispace.value].impl)
+    var [result_len] = c.legion_domain_get_volume([ispace_domain])
 
     -- Allocate list.
     var data = c.malloc(terralib.sizeof([expr_type.element_type]) * [result_len])
