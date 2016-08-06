@@ -78,6 +78,7 @@ function render.top(cx, node)
 end
 
 function render.entry(cx, node)
+  if not cx then cx = context.new_render_scope() end
   return render.top(cx, node):concat("\n")
 end
 
@@ -167,7 +168,7 @@ end
 
 function pretty.expr_condition(cx, node)
   return join({
-      join(node.conditions, true), "(", pretty.expr(cx, node.value), ")"})
+      join(node.conditions:map(tostring), true), "(", pretty.expr(cx, node.value), ")"})
 end
 
 function pretty.expr_region_root(cx, node)
@@ -441,6 +442,13 @@ function pretty.expr_list_range(cx, node)
       ")"})
 end
 
+function pretty.expr_list_ispace(cx, node)
+  return join({
+      "list_ispace(",
+      commas({pretty.expr(cx, node.ispace)}),
+      ")"})
+end
+
 function pretty.expr_phase_barrier(cx, node)
   return join({
       "phase_barrier(", commas({pretty.expr(cx, node.value)}), ")"})
@@ -557,6 +565,7 @@ function pretty.expr_future_get_result(cx, node)
 end
 
 function pretty.expr(cx, node)
+  if not cx then cx = context.new_render_scope() end
   if node:is(ast.typed.expr.ID) then
     return pretty.expr_id(cx, node)
 
@@ -667,6 +676,9 @@ function pretty.expr(cx, node)
 
   elseif node:is(ast.typed.expr.ListRange) then
     return pretty.expr_list_range(cx, node)
+
+  elseif node:is(ast.typed.expr.ListIspace) then
+    return pretty.expr_list_ispace(cx, node)
 
   elseif node:is(ast.typed.expr.PhaseBarrier) then
     return pretty.expr_phase_barrier(cx, node)
@@ -900,6 +912,7 @@ function pretty.stat_raw_delete(cx, node)
 end
 
 function pretty.stat(cx, node)
+  if not cx then cx = context.new_global_scope() end
   if node:is(ast.typed.stat.If) then
     return pretty.stat_if(cx, node)
 
@@ -1012,7 +1025,11 @@ end
 function pretty.top_task_constraints(cx, node)
   if not node then return terralib.newlist() end
   return node:map(
-    function(constraint) return text.Line { value = tostring(constraint) } end)
+    function(constraint)
+      return join({tostring(constraint.lhs), tostring(constraint.op),
+                   tostring(constraint.rhs)},
+        true)
+    end)
 end
 
 function pretty.task_config_options(cx, node)
@@ -1074,6 +1091,8 @@ function pretty.entry(node)
   local cx = context.new_global_scope()
   return render.entry(cx:new_render_scope(), pretty.top(cx, node))
 end
+
+pretty.render = render
 
 return pretty
 

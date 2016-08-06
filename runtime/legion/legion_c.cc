@@ -510,6 +510,16 @@ legion_index_space_destroy(legion_runtime_t runtime_,
   runtime->destroy_index_space(ctx, handle);
 }
 
+bool
+legion_index_space_has_multiple_domains(legion_runtime_t runtime_,
+                                        legion_index_space_t handle_)
+{
+  Runtime *runtime = CObjectWrapper::unwrap(runtime_);
+  IndexSpace handle = CObjectWrapper::unwrap(handle_);
+
+  return runtime->has_multiple_domains(handle);
+}
+
 legion_domain_t
 legion_index_space_get_domain(legion_runtime_t runtime_,
                               legion_index_space_t handle_)
@@ -1925,6 +1935,16 @@ legion_logical_region_get_color(legion_runtime_t runtime_,
   return runtime->get_logical_region_color(handle);
 }
 
+legion_domain_point_t
+legion_logical_region_get_color_domain_point(legion_runtime_t runtime_,
+                                             legion_logical_region_t handle_)
+{
+  Runtime *runtime = CObjectWrapper::unwrap(runtime_);
+  LogicalRegion handle = CObjectWrapper::unwrap(handle_);
+
+  return CObjectWrapper::wrap(runtime->get_logical_region_color_point(handle));
+}
+
 bool
 legion_logical_region_has_parent_logical_partition(
   legion_runtime_t runtime_,
@@ -2616,6 +2636,15 @@ legion_future_from_bytes(legion_runtime_t runtime_,
   Runtime *runtime = CObjectWrapper::unwrap(runtime_);
 
   Future *result = new Future(Future::from_untyped_pointer(runtime, buffer, size));
+  return CObjectWrapper::wrap(result);
+}
+
+legion_future_t
+legion_future_copy(legion_future_t handle_)
+{
+  Future *handle = CObjectWrapper::unwrap(handle_);
+
+  Future *result = new Future(*handle);
   return CObjectWrapper::wrap(result);
 }
 

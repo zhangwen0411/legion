@@ -29,10 +29,19 @@ local default_options = {
   ["mapping"] = true,
   ["vectorize"] = true,
 
+  -- Legion runtime optimization flags:
+  ["legion-leaf"] = true,
+  ["legion-inner"] = true,
+
   -- Dataflow optimization flags:
   ["flow"] = os.getenv('USE_RDIR') == '1' or false,
   ["flow-spmd"] = false,
   ["flow-spmd-shardsize"] = 1,
+
+  -- Experimental auto-parallelization flags:
+  ["parallelize"] = true,
+  ["parallelize-dop"] = 4,
+  ["parallelize-global"] = true,
 
   -- Miscellaneous, internal or special-purpose flags:
   ["aligned-instances"] = false,

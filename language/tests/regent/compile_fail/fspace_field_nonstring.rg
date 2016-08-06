@@ -13,12 +13,15 @@
 -- limitations under the License.
 
 -- fails-with:
--- annotations_task_parallel.rg:23: option __demand(__parallel) is not permitted
--- task f() end
---    ^
+-- fspace_field_nonstring.rg:25: expected a string but found number
+--   var x = s { [ 1 ] = 2 }
+--               ^
 
 import "regent"
 
-__demand(__parallel)
-task f() end
+fspace s { a : int }
+
+task f()
+  var x = s { [ 1 ] = 2 }
+end
 f:compile()
