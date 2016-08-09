@@ -109,8 +109,8 @@ terra common.read_config()
   if tprune ~= nil then
     conf.tprune = c.atoll(tprune)
   end
-  if conf.tprune <= 0 then
-    c.printf("Error: tprune (%lld) must be > 0\n", conf.tprune)
+  if conf.tprune < 0 then
+    c.printf("Error: tprune (%lld) must be >= 0\n", conf.tprune)
     c.abort()
   end
 
