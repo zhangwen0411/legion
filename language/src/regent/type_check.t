@@ -2067,8 +2067,44 @@ function type_check.expr_list_ispace(cx, node)
   end
   local expr_type = std.list(ispace_type.index_type)
 
+  local mapping = node.mapping
+  if mapping then
+    -- Make sure that `mapping` takes appropriate parameters.
+    local index_type = ispace_type.index_type
+    local rect_type = std.rect_type(index_type)
+
+    -- THIS ONLY WORKS ON STRUCTURED.
+    local zero = index_type:zero()
+    local p = ast.specialized.expr.Constant {
+      value = zero,
+      expr_type = index_type,
+      annotations = ast.default_annotations(),
+      span = mapping.span,
+    }
+    local space = ast.specialized.expr.Constant {
+      value = `([rect_type] { lo = zero, hi = zero }),
+      expr_type = rect_type,
+      annotations = ast.default_annotations(),
+      span = mapping.span,
+    }
+    local call = ast.specialized.expr.Call {
+      fn = node.mapping,
+      args = terralib.newlist({ p, space }),
+      conditions = terralib.newlist({}),
+      annotations = ast.default_annotations(),
+      span = mapping.span,
+    }
+
+    local typed_call = type_check.expr(cx, call)
+    if not std.validate_implicit_cast(typed_call.expr_type, int) then
+      log.error(mapping, "list_ispace mapping needs to return an integral value")
+    end
+    mapping = typed_call.fn
+  end
+
   return ast.typed.expr.ListIspace {
     ispace = ispace,
+    mapping = mapping,
     expr_type = expr_type,
     annotations = node.annotations,
     span = node.span,
@@ -2666,7 +2702,8 @@ function type_check.expr(cx, node)
     return type_check.expr_method_call(cx, node)
 
   elseif node:is(ast.specialized.expr.Call) then
-    return type_check.expr_call(cx, node)
+    local result = type_check.expr_call(cx, node)
+    return result
 
   elseif node:is(ast.specialized.expr.Cast) then
     return type_check.expr_cast(cx, node)

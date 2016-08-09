@@ -4528,24 +4528,50 @@ function codegen.expr_list_range(cx, node)
     expr_type)
 end
 
-local function make_mapping_call(mapping, p, i, domain, ispace_type)
-  -- TODO(zhangwen): more asserts about match between `domain` and `ispace_type`?
-  if not mapping then return `i end
+local function make_mapping_call(cx, node, p, i, domain, ispace_type)
+  local mapping = node.mapping
+  print(mapping)
+  if not mapping then
+    return values.value (
+      node,
+      expr.just(quote end, `i),
+      int
+    )
+  end
 
   assert(std.is_ispace(ispace_type))
   local index_type = ispace_type.index_type
-  assert(std.is_index_type(index_type))
-
-  if index_type.dim == 0 then
-    return `(mapping(p, i))
-  end
+  assert(index_type.dim > 0) -- TODO(zhangwen): get rid of this.
 
   local get_rect = c["legion_domain_get_rect_" .. index_type.dim .. "d"]
   assert(get_rect)
-  return quote
-    var rect = [get_rect](domain)
-    in mapping(p, i, [index_type.from_point](rect.lo), [index_type.from_point](rect.hi))
-  end
+
+  local param_p = ast.typed.expr.Internal {
+    value = values.value(node, expr.just(quote end, p), index_type),
+    expr_type = index_type,
+    annotations = ast.default_annotations(),
+    span = node.span,
+  }
+
+  local rect_type = std.rect_type(index_type)
+  local param_space = ast.typed.expr.Internal {
+    value = values.value(node,
+      expr.just(quote end, `([rect_type]([get_rect]([domain])))), rect_type),
+    expr_type = rect_type,
+    annotations = ast.default_annotations(),
+    span = node.span,
+  }
+
+  local call = ast.typed.expr.Call {
+    fn = mapping,
+    args = terralib.newlist({ param_p, param_space }),
+    conditions = terralib.newlist({}),
+    expr_type = int,
+    annotations = ast.default_annotations(),
+    span = node.span,
+  }
+
+  return codegen.expr(cx, call)
 end
 
 function codegen.expr_list_ispace(cx, node)
@@ -4570,10 +4596,13 @@ function codegen.expr_list_ispace(cx, node)
   -- Index in list: `result[i] = p; i += 1`.
   local i = terralib.newsymbol(int, "i")
 
+  local mapping_call = make_mapping_call(
+    cx, node, p_symbol:getsymbol(), i, ispace_domain, ispace_type):read(cx, int)
+
   local loop_body = ast.typed.stat.Internal {
     actions = quote
-      var curr_index =
-        [make_mapping_call(node.mapping, p_symbol:getsymbol(), i, ispace_domain, ispace_type)];
+      [mapping_call.actions]
+      var curr_index = [mapping_call.value];
       -- TODO(zhangwen): assert that `curr_index` hasn't been used.
       regentlib.assert((curr_index >= 0) and (curr_index < [result_len]),
         "list index out of bounds in list_ispace")
@@ -4583,6 +4612,7 @@ function codegen.expr_list_ispace(cx, node)
     annotations = ast.default_annotations(),
     span = node.span,
   }
+
   local populate_list_loop = ast.typed.stat.ForList {
     symbol = p_symbol,
     value = node.ispace,
