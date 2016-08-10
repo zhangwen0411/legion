@@ -4648,6 +4648,19 @@ function codegen.expr_list_ispace(cx, node)
     [codegen.stat(cx, populate_list_loop)]
   end
 
+  if std.config["flow-spmd-mapping-shuffle"] then
+    actions = quote
+      [actions]
+
+      for i = 0, [result_len] do
+        var swap_idx = c.rand() % ([result_len] - i) + i
+        var tmp = [expr_type:data(result)][i]
+        [expr_type:data(result)][i] = [expr_type:data(result)][swap_idx]
+        [expr_type:data(result)][swap_idx] = tmp
+      end
+    end
+  end
+
   return values.value(
     node,
     expr.just(actions, result),
