@@ -100,8 +100,8 @@ terra common.read_config()
   if tsteps ~= nil then
     conf.tsteps = c.atoll(tsteps)
   end
-  if conf.tsteps <= 0 then
-    c.printf("Error: tsteps (%lld) must be > 0\n", conf.tsteps)
+  if conf.tsteps < 0 then
+    c.printf("Error: tsteps (%lld) must be >= 0\n", conf.tsteps)
     c.abort()
   end
 

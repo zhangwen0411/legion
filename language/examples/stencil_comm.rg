@@ -19,7 +19,7 @@ import "regent"
 local common = require("stencil_common")
 
 local DTYPE = double
-local RADIUS = 20
+local RADIUS = 36
 
 local c = regentlib.c
 
@@ -167,6 +167,9 @@ task main()
   regentlib.assert(n >= nt, "grid too small")
 
   var tiles = ispace(int2d, nt)
+
+  var total_size = 8*(nt.x*radius*n.y*2 + n.x*nt.y*radius*2)
+  c.printf("Total size: %ld bytes.\n", total_size);
 
   var xm = region(ispace(int2d, { x = nt.x*radius, y = n.y }), point)
   var xp = region(ispace(int2d, { x = nt.x*radius, y = n.y }), point)
