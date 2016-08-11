@@ -4530,7 +4530,7 @@ end
 
 local function make_mapping_call(cx, node, p, i, domain, ispace_type)
   local mapping = node.mapping
-  print(mapping)
+  -- print(mapping)
   if not mapping then
     return values.value (
       node,
@@ -4579,7 +4579,7 @@ function codegen.expr_list_ispace(cx, node)
   local ispace = codegen.expr(cx, node.ispace):read(cx, ispace_type)
   local expr_type = std.as_read(node.expr_type)
 
-  local result = terralib.newsymbol(expr_type, "result") -- Resulting list.
+  local result = terralib.newsymbol(expr_type, "result") -- Result list.
   local result_len = terralib.newsymbol(uint64, "result_len")
 
   -- Construct AST that populates the `result` list with indices from `ispace`.
@@ -4592,9 +4592,24 @@ function codegen.expr_list_ispace(cx, node)
   else
     bound = std.newsymbol(ispace_type)
   end
-  local p_symbol = std.newsymbol(ispace_type.index_type(bound), "p")
+  local index_type = ispace_type.index_type(bound)
+  local p_symbol = std.newsymbol(index_type, "p")
   -- Index in list: `result[i] = p; i += 1`.
   local i = terralib.newsymbol(int, "i")
+
+  -- Initially, each index in the index space is stored in a `WeightedIndex`
+  -- with its weight returned by `mapping`.  The indices will then be sorted
+  -- by their weights and stored in the `result` list.
+  local struct WeightedIndex {
+    index : index_type;
+    weight : int;
+  }
+  -- Compare function for the C qsort function.
+  terra WeightedIndex.compare(a : &opaque, b : &opaque) : int
+    return ([&WeightedIndex](a)).weight - ([&WeightedIndex](b)).weight
+  end
+  -- List of (index, weight) pairs.
+  local weighted_indices = terralib.newsymbol(&WeightedIndex, "weighted_indices")
 
   local mapping_call = make_mapping_call(
     cx, node, p_symbol:getsymbol(), i, ispace_domain, ispace_type):read(cx, int)
@@ -4602,11 +4617,11 @@ function codegen.expr_list_ispace(cx, node)
   local loop_body = ast.typed.stat.Internal {
     actions = quote
       [mapping_call.actions]
-      var curr_index = [mapping_call.value];
-      -- TODO(zhangwen): assert that `curr_index` hasn't been used.
-      regentlib.assert((curr_index >= 0) and (curr_index < [result_len]),
+      var weight = [mapping_call.value];
+      regentlib.assert((i >= 0) and (i < [result_len]),
         "list index out of bounds in list_ispace")
-      [expr_type:data(result)][curr_index] = [p_symbol:getsymbol()]
+      [weighted_indices][i] = WeightedIndex {
+        index = [p_symbol:getsymbol()], weight = weight }
       [i] = [i] + 1
     end,
     annotations = ast.default_annotations(),
@@ -4635,30 +4650,28 @@ function codegen.expr_list_ispace(cx, node)
     var [ispace_domain] = c.legion_index_space_get_domain([cx.runtime], [ispace.value].impl)
     var [result_len] = c.legion_domain_get_volume([ispace_domain])
 
-    -- Allocate list.
+    var [weighted_indices] = [&WeightedIndex](
+      c.malloc(terralib.sizeof(WeightedIndex) * [result_len]))
+    regentlib.assert([weighted_indices] ~= nil, "malloc failed in list_ispace")
+    -- Populate `weighted_indices` with indices from index space.
+    var [i] = 0;
+    [codegen.stat(cx, populate_list_loop)]
+    regentlib.assert(i == [result_len], "list_ispace final index doesn't match list length")
+    c.qsort([weighted_indices], [result_len], terralib.sizeof(WeightedIndex),
+      [WeightedIndex.compare])
+    -- Allocate and populate result list.
     var data = c.malloc(terralib.sizeof([expr_type.element_type]) * [result_len])
     regentlib.assert(data ~= nil, "malloc failed in list_ispace")
     var [result] = expr_type {
       __size = [result_len],
       __data = data
     }
+    for j = 0, [result_len] do
+      [expr_type:data(result)][j] = [weighted_indices][j].index
 
-    -- Populate list with indices from index space.
-    var [i] = 0;
-    [codegen.stat(cx, populate_list_loop)]
-  end
-
-  if std.config["flow-spmd-mapping-shuffle"] then
-    actions = quote
-      [actions]
-
-      for i = 0, [result_len] do
-        var swap_idx = c.rand() % ([result_len] - i) + i
-        var tmp = [expr_type:data(result)][i]
-        [expr_type:data(result)][i] = [expr_type:data(result)][swap_idx]
-        [expr_type:data(result)][swap_idx] = tmp
-      end
+      c.printf("(%d, %d)\n", [weighted_indices][j].index.__ptr.x, [weighted_indices][j].index.__ptr.y)
     end
+    c.free([weighted_indices])
   end
 
   return values.value(
