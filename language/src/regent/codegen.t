@@ -4668,8 +4668,7 @@ function codegen.expr_list_ispace(cx, node)
     }
     for j = 0, [result_len] do
       [expr_type:data(result)][j] = [weighted_indices][j].index
-
-      c.printf("(%d, %d)\n", [weighted_indices][j].index.__ptr.x, [weighted_indices][j].index.__ptr.y)
+      -- c.printf("(%d, %d)\n", [weighted_indices][j].index.__ptr.x, [weighted_indices][j].index.__ptr.y)
     end
     c.free([weighted_indices])
   end
