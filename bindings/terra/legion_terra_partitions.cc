@@ -324,8 +324,8 @@ create_cross_product_structured(HighLevelRuntime *runtime,
     IndexSpace lh_space = runtime->get_index_subspace(ctx, lhs, lh_color);
     // Doesn't currently handle structured index spaces consisting of multiple
     // domains.
-    assert(!runtime->has_multiple_domains(lh_space));
-    Domain lh_domain = runtime->get_index_space_domain(lh_space);
+    assert(!runtime->has_multiple_domains(ctx, lh_space));
+    Domain lh_domain = runtime->get_index_space_domain(ctx, lh_space);
     // Verify that index space is indeed structured.
     assert(lh_domain.get_dim() > 0);
 
@@ -334,8 +334,8 @@ create_cross_product_structured(HighLevelRuntime *runtime,
       if (rhs_filter && !rhs_filter->count(rh_color)) continue;
 
       IndexSpace rh_space = runtime->get_index_subspace(ctx, rhs, rh_color);
-      assert(!runtime->has_multiple_domains(rh_space));
-      Domain rh_domain = runtime->get_index_space_domain(rh_space);
+      assert(!runtime->has_multiple_domains(ctx, rh_space));
+      Domain rh_domain = runtime->get_index_space_domain(ctx, rh_space);
       assert(rh_domain.get_dim() > 0);
 
       // Take and store intersecton of the two rect domains.
@@ -817,6 +817,56 @@ create_cross_product_tree(HighLevelRuntime *runtime,
   }
 }
 
+// For each index space in `ispaces`, adds its domain's rectangle to `rects`.
+// ASSUMES that each ispace is structured and only has one domain.
+// `DIM` should match the dimensionality of the index spaces.
+template <unsigned DIM>
+static void
+extract_ispace_domain_rects(HighLevelRuntime *runtime,
+                            Context ctx,
+                            const std::vector<IndexSpace> &ispaces,
+                            std::vector<Rect<DIM> >& rects)
+{
+  assert(DIM > 0);
+  assert(rects.empty());
+  rects.reserve(ispaces.size());
+  for (size_t i = 0; i < ispaces.size(); i++) {
+    const IndexSpace &ispace = ispaces[i];
+    // Doesn't currently handle structured index spaces with multiple domains.
+    assert(!runtime->has_multiple_domains(ctx, ispace));
+    Domain domain = runtime->get_index_space_domain(ctx, ispace);
+    rects.push_back(domain.get_rect<DIM>());
+  }
+}
+
+// Version of `create_cross_product_shallow_structured` templetized on the
+// dimensionality of the structured index spaces.
+template <unsigned DIM>
+static void
+create_cross_product_shallow_structured_spec(
+    HighLevelRuntime *runtime,
+    Context ctx,
+    const std::vector<IndexSpace> &lhs,
+    const std::vector<IndexSpace> &rhs,
+    legion_terra_index_space_list_list_t &result)
+{
+  assert(DIM > 0); // Should be structured.
+
+  std::vector<Rect<DIM> > lh_rects, rh_rects;
+  extract_ispace_domain_rects<DIM>(runtime, ctx, lhs, lh_rects);
+  extract_ispace_domain_rects<DIM>(runtime, ctx, rhs, rh_rects);
+
+  for (size_t i = 0; i < lhs.size(); i++) {
+    Rect<DIM> lh_rect = lh_rects[i];
+    for (size_t j = 0; j < rhs.size(); j++) {
+      Rect<DIM> rh_rect = rh_rects[j];
+      if (lh_rect.overlaps(rh_rect)) {
+        assign_list_list(result, i, j, CObjectWrapper::wrap(rhs[j]));
+      }
+    }
+  }
+}
+
 // Takes the "shallow" cross product between lists of structured index spaces
 // `lhs` and `rhs`.  Specifically, if `lhs[i]` and `rhs[j]` intersect,
 // `result[i][j]` is populated with `rhs[j]`.
@@ -827,24 +877,32 @@ create_cross_product_shallow_structured(HighLevelRuntime *runtime,
                                         const std::vector<IndexSpace> &rhs,
                                         legion_terra_index_space_list_list_t &result)
 {
-  for (size_t i = 0; i < lhs.size(); i++) {
-    const IndexSpace &lh_space = lhs[i];
-    // Doesn't currently handle structured index spaces with multiple domains.
-    assert(!runtime->has_multiple_domains(lh_space));
-    Domain lh_domain = runtime->get_index_space_domain(ctx, lh_space);
-    assert(lh_domain.get_dim() > 0); // Should be structured.
+  if (lhs.empty() || rhs.empty()) return;
 
-    for (size_t j = 0; j < rhs.size(); j++) {
-      const IndexSpace &rh_space = rhs[j];
-      assert(!runtime->has_multiple_domains(rh_space));
-      Domain rh_domain = runtime->get_index_space_domain(ctx, rh_space);
-      assert(rh_domain.get_dim() > 0);
-
-      if (lh_domain.intersection(rh_domain).get_volume() > 0) {
-        // Intersection isn't empty.
-        assign_list_list(result, i, j, CObjectWrapper::wrap(rh_space));
+  int dim = runtime->get_index_space_domain(ctx, lhs[0]).get_dim();
+  switch (dim) {
+    case 0:
+      assert(false); // Index space should be structured.
+    case 1:
+      {
+        create_cross_product_shallow_structured_spec<1>(
+            runtime, ctx, lhs, rhs, result);
+        break;
       }
-    }
+    case 2:
+      {
+        create_cross_product_shallow_structured_spec<2>(
+            runtime, ctx, lhs, rhs, result);
+        break;
+      }
+    case 3:
+      {
+        create_cross_product_shallow_structured_spec<3>(
+            runtime, ctx, lhs, rhs, result);
+        break;
+      }
+    default:
+      assert(false);
   }
 }
 
@@ -1303,8 +1361,8 @@ create_cross_product_complete_structured(
     IndexSpace lh_space = lhs[lhs_idx];
     // Doesn't currently handle structured index spaces consisting of multiple
     // domains.
-    assert(!runtime->has_multiple_domains(lh_space));
-    Domain lh_domain = runtime->get_index_space_domain(lh_space);
+    assert(!runtime->has_multiple_domains(ctx, lh_space));
+    Domain lh_domain = runtime->get_index_space_domain(ctx, lh_space);
     // Verify that index space is indeed structured.
     assert(lh_domain.get_dim() > 0);
 
@@ -1313,8 +1371,8 @@ create_cross_product_complete_structured(
 
     for (unsigned rhs_idx = 0; rhs_idx < rh_spaces.size(); ++rhs_idx) {
       IndexSpace rh_space = rh_spaces[rhs_idx];
-      assert(!runtime->has_multiple_domains(rh_space));
-      Domain rh_domain = runtime->get_index_space_domain(rh_space);
+      assert(!runtime->has_multiple_domains(ctx, rh_space));
+      Domain rh_domain = runtime->get_index_space_domain(ctx, rh_space);
       assert(rh_domain.get_dim() > 0);
 
       coloring[rh_space][lh_color] = rh_domain.intersection(lh_domain);
