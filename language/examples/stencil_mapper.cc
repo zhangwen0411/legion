@@ -46,6 +46,8 @@ namespace Legion {
       virtual void map_must_epoch(const MapperContext           ctx,
                                   const MapMustEpochInput&      input,
                                   MapMustEpochOutput&     output);
+      virtual Memory default_policy_select_target_memory(MapperContext ctx, 
+                                        Processor target_proc);
 
     private:
       void default_create_copy_instance(MapperContext ctx,
@@ -238,8 +240,8 @@ namespace Legion {
       // Now let's map the constraints, find one requirement to use for
       // mapping each of the constraints, but get the set of fields we
       // care about and the set of logical regions for all the requirements
-      printf("num iters: %lu\n", input.constraints.size());
-      printf("start: %llu\n", Realm::Clock::current_time_in_microseconds());
+      // printf("num iters: %lu\n", input.constraints.size());
+      // printf("start: %llu\n", Realm::Clock::current_time_in_microseconds());
       for (unsigned cid = 0; cid < input.constraints.size(); cid++)
       {
         const MappingConstraint &constraint = input.constraints[cid];
@@ -266,7 +268,6 @@ namespace Legion {
           needed_fields.insert(task->regions[req_idx].privilege_fields.begin(),
                                task->regions[req_idx].privilege_fields.end());
         }
-        printf("B: %llu\n", Realm::Clock::current_time_in_microseconds());
         // If there wasn't a region requirement that wasn't no access just 
         // pick the first one since this case doesn't make much sense anyway
         if (base_task == NULL)
@@ -277,7 +278,6 @@ namespace Legion {
         }
         Memory target_memory = default_policy_select_target_memory(ctx, 
                                                                    base_proc);
-        printf("C: %llu\n", Realm::Clock::current_time_in_microseconds());
         VariantInfo info = default_find_preferred_variant(*base_task, ctx, 
                true/*needs tight bound*/, true/*cache*/, Processor::LOC_PROC);
         const TaskLayoutConstraintSet &layout_constraints = 
@@ -319,7 +319,39 @@ namespace Legion {
           }
         }
       }
-      printf("finish: %llu\n", Realm::Clock::current_time_in_microseconds());
+      // printf("finish: %llu\n", Realm::Clock::current_time_in_microseconds());
+    }
+
+    Memory StencilMapper::default_policy_select_target_memory(MapperContext ctx, 
+                                                              Processor target_proc)
+    {
+      // Find the visible memories from the processor for the given kind
+      Machine::MemoryQuery visible_memories(machine);
+      visible_memories.has_affinity_to(target_proc);
+      if (visible_memories.count() == 0)
+      {
+        log_mapper.error("No visible memories from processor " IDFMT "! "
+            "This machine is really messed up!", target_proc.id);
+        assert(false);
+      }
+      // Figure out the memory with the highest-bandwidth
+      Memory chosen = Memory::NO_MEMORY;
+      unsigned best_bandwidth = 0;
+      std::vector<Machine::ProcessorMemoryAffinity> affinity(1);
+      for (Machine::MemoryQuery::iterator it = visible_memories.begin();
+          it != visible_memories.end(); it++)
+      {
+        affinity.clear();
+        machine.get_proc_mem_affinity(affinity, target_proc, *it);
+        assert(affinity.size() == 1);
+        std::cout << affinity[0].bandwidth << std::endl;
+        if (!chosen.exists() || (affinity[0].bandwidth > best_bandwidth)) {
+          chosen = *it;
+          best_bandwidth = affinity[0].bandwidth;
+        }
+      }
+      assert(chosen.exists());
+      return chosen;
     }
   };
 };
