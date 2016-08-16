@@ -37,7 +37,8 @@ namespace Legion {
                     const char *mapper_name, std::vector<Processor>* procs_list,
                     std::vector<Memory>* sysmems_list,
                     std::map<Processor, Memory>* proc_sysmems,
-                    std::map<Memory, std::vector<Processor> >* sysmem_local_procs);
+                    std::map<Memory, std::vector<Processor> >* sysmem_local_procs,
+                    std::map<Processor, Memory>* proc_target_mems);
 
       virtual void map_copy(const MapperContext      ctx,
                             const Copy&              copy,
@@ -59,6 +60,7 @@ namespace Legion {
       std::vector<Memory>& sysmems_list;
       std::map<Processor, Memory>& proc_sysmems;
       std::map<Memory, std::vector<Processor> >& sysmem_local_procs;
+      std::map<Processor, Memory>& proc_target_mems;
     };
 
 
@@ -66,10 +68,12 @@ namespace Legion {
                                  const char *mapper_name, std::vector<Processor>* _procs_list,
                                  std::vector<Memory>* _sysmems_list,
                                  std::map<Processor, Memory>* _proc_sysmems,
-                                 std::map<Memory, std::vector<Processor> >* _sysmem_local_procs)
+                                 std::map<Memory, std::vector<Processor> >* _sysmem_local_procs,
+                                 std::map<Processor, Memory>* _proc_target_mems)
       : DefaultMapper(rt, machine, local, mapper_name),
         procs_list(*_procs_list), sysmems_list(*_sysmems_list),
-        proc_sysmems(*_proc_sysmems), sysmem_local_procs(*_sysmem_local_procs)
+        proc_sysmems(*_proc_sysmems), sysmem_local_procs(*_sysmem_local_procs),
+        proc_target_mems(*_proc_target_mems)
     {
     }
 
@@ -325,33 +329,9 @@ namespace Legion {
     Memory StencilMapper::default_policy_select_target_memory(MapperContext ctx, 
                                                               Processor target_proc)
     {
-      // Find the visible memories from the processor for the given kind
-      Machine::MemoryQuery visible_memories(machine);
-      visible_memories.has_affinity_to(target_proc);
-      if (visible_memories.count() == 0)
-      {
-        log_mapper.error("No visible memories from processor " IDFMT "! "
-            "This machine is really messed up!", target_proc.id);
-        assert(false);
-      }
-      // Figure out the memory with the highest-bandwidth
-      Memory chosen = Memory::NO_MEMORY;
-      unsigned best_bandwidth = 0;
-      std::vector<Machine::ProcessorMemoryAffinity> affinity(1);
-      for (Machine::MemoryQuery::iterator it = visible_memories.begin();
-          it != visible_memories.end(); it++)
-      {
-        affinity.clear();
-        machine.get_proc_mem_affinity(affinity, target_proc, *it);
-        assert(affinity.size() == 1);
-        std::cout << affinity[0].bandwidth << std::endl;
-        if (!chosen.exists() || (affinity[0].bandwidth > best_bandwidth)) {
-          chosen = *it;
-          best_bandwidth = affinity[0].bandwidth;
-        }
-      }
-      assert(chosen.exists());
-      return chosen;
+      Memory target_mem = proc_target_mems[target_proc];
+      assert(target_mem.exists());
+      return target_mem;
     }
   };
 };
@@ -367,6 +347,9 @@ static void create_mappers(Machine machine, HighLevelRuntime *runtime, const std
   std::map<Processor, Memory>* proc_sysmems = new std::map<Processor, Memory>();
   std::map<Processor, Memory>* proc_regmems = new std::map<Processor, Memory>();
 
+  std::map<Processor, Memory>* proc_target_mems = new std::map<Processor, Memory>();
+  std::map<Processor, unsigned> proc_best_bandwidth;
+
   std::vector<Machine::ProcessorMemoryAffinity> proc_mem_affinities;
   machine.get_proc_mem_affinity(proc_mem_affinities);
 
@@ -380,6 +363,11 @@ static void create_mappers(Machine machine, HighLevelRuntime *runtime, const std
       }
       else if (affinity.m.kind() == Memory::REGDMA_MEM)
         (*proc_regmems)[affinity.p] = affinity.m;
+    }
+
+    if (affinity.bandwidth >= proc_best_bandwidth[affinity.p]) {
+      proc_best_bandwidth[affinity.p] = affinity.bandwidth;
+      (*proc_target_mems)[affinity.p] = affinity.m;
     }
   }
 
@@ -399,7 +387,7 @@ static void create_mappers(Machine machine, HighLevelRuntime *runtime, const std
     StencilMapper* mapper = new StencilMapper(runtime->get_mapper_runtime(),
                                               machine, *it, "stencil_mapper",
                                               procs_list, sysmems_list, proc_sysmems,
-                                              sysmem_local_procs);
+                                              sysmem_local_procs, proc_target_mems);
     runtime->replace_default_mapper(mapper, *it);
   }
 }
