@@ -2148,7 +2148,7 @@ local function validate_index_base_type(base_type)
          "Index type expected a type, got " .. tostring(base_type))
   if std.type_eq(base_type, opaque) then
     return c.legion_ptr_t, 0, terralib.newlist({"value"})
-  elseif std.type_eq(base_type, int) then
+  elseif base_type:isintegral() then
     return base_type, 1, false
   elseif base_type:isstruct() then
     local entries = base_type:getentries()
@@ -2157,14 +2157,14 @@ local function validate_index_base_type(base_type)
              tostring(#entries))
     for _, entry in ipairs(entries) do
       local field_type = entry[2] or entry.type
-      assert(std.type_eq(field_type, int),
-             "Multi-dimensional index type expected fields to be " .. tostring(int) ..
+      assert(terralib.types.istype(field_type) and field_type:isintegral(),
+             "Multi-dimensional index type expected fields to be integral" ..
                ", got " .. tostring(field_type))
     end
     return base_type, #entries, entries:map(function(entry) return entry[1] or entry.field end)
   else
     assert(false, "Index type expected " .. tostring(opaque) .. ", " ..
-             tostring(int) .. " or a struct, got " .. tostring(base_type))
+             "an integral type, or a struct, got " .. tostring(base_type))
   end
 end
 
@@ -2438,10 +2438,10 @@ function std.index_type(base_type, displayname)
   return setmetatable(st, index_type)
 end
 
-local struct __int2d { x : int, y : int }
-local struct __int3d { x : int, y : int, z : int }
+local struct __int2d { x : int64, y : int64 }
+local struct __int3d { x : int64, y : int64, z : int64 }
 std.ptr = std.index_type(opaque, "ptr")
-std.int1d = std.index_type(int, "int1d")
+std.int1d = std.index_type(int64, "int1d")
 std.int2d = std.index_type(__int2d, "int2d")
 std.int3d = std.index_type(__int3d, "int3d")
 

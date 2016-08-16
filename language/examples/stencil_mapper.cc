@@ -36,7 +36,8 @@ namespace Legion {
       StencilMapper(MapperRuntime *rt, Machine machine, Processor local,
                     const char *mapper_name, std::vector<Processor>* procs_list,
                     std::vector<Memory>* sysmems_list,
-                    std::map<Processor, Memory>* proc_sysmems);
+                    std::map<Processor, Memory>* proc_sysmems,
+                    std::map<Memory, std::vector<Processor> >* sysmem_local_procs);
 
       virtual void map_copy(const MapperContext      ctx,
                             const Copy&              copy,
@@ -55,15 +56,18 @@ namespace Legion {
       std::vector<Processor>& procs_list;
       std::vector<Memory>& sysmems_list;
       std::map<Processor, Memory>& proc_sysmems;
+      std::map<Memory, std::vector<Processor> >& sysmem_local_procs;
     };
 
 
     StencilMapper::StencilMapper(MapperRuntime *rt, Machine machine, Processor local,
                                  const char *mapper_name, std::vector<Processor>* _procs_list,
                                  std::vector<Memory>* _sysmems_list,
-                                 std::map<Processor, Memory>* _proc_sysmems)
+                                 std::map<Processor, Memory>* _proc_sysmems,
+                                 std::map<Memory, std::vector<Processor> >* _sysmem_local_procs)
       : DefaultMapper(rt, machine, local, mapper_name),
-        procs_list(*_procs_list), sysmems_list(*_sysmems_list), proc_sysmems(*_proc_sysmems)
+        procs_list(*_procs_list), sysmems_list(*_sysmems_list),
+        proc_sysmems(*_proc_sysmems), sysmem_local_procs(*_sysmem_local_procs)
     {
     }
 
@@ -153,9 +157,9 @@ namespace Legion {
       Processor target_proc = procs_list[index % procs_list.size()];
       Memory target_memory = proc_sysmems[target_proc];
       */
-      Memory target_memory = sysmems_list[index % sysmems_list.size()];
-
-      std::cout << cr << ", " << index << ", " << target_memory << std::endl;
+      const unsigned long shardsize = 8;
+      Memory target_memory = sysmems_list[(index / shardsize) % sysmems_list.size()];
+      // std::cout << cr << ", " << index << ", " << target_memory << std::endl;
 
       bool force_new_instances = false;
       LayoutConstraintID our_layout_id = 
@@ -184,29 +188,35 @@ namespace Legion {
                                        const MapMustEpochInput&      input,
                                        MapMustEpochOutput&     output)
     {
+      std::vector<Processor > all_procs;
+      for (std::map<Memory, std::vector<Processor> >::iterator it = sysmem_local_procs.begin();
+           it != sysmem_local_procs.end(); ++it)
+      {
+        if (!it->second.empty()) all_procs.push_back(it->second[0]);
+      }
+      unsigned num_sysmems = all_procs.size();
+
       log_mapper.spew("Default map_must_epoch in %s", get_mapper_name());
       // Figure out how to assign tasks to CPUs first. We know we can't
       // do must epochs for anthing but CPUs at the moment.
       std::map<const Task*,Processor> proc_map;
       if (total_nodes > 1)
       {
-        std::cout << "total_nodes = " << total_nodes << std::endl;
-        Machine::ProcessorQuery all_procs(machine);
-        all_procs.only_kind(Processor::LOC_PROC);
-        Machine::ProcessorQuery::iterator proc_finder = all_procs.begin();
-        std::cout << "input tasks size = " << input.tasks.size() << std::endl;
-        for (unsigned idx = 0; idx < input.tasks.size(); idx++, proc_finder++)
+        if (input.tasks.size() > num_sysmems)
         {
-          if (proc_finder == all_procs.end())
-          {
-            log_mapper.error("Default mapper error. Not enough CPUs for must "
-                             "epoch launch of task %s with %ld tasks", 
-                             input.tasks[0]->get_task_name(),
-                             input.tasks.size());
-            assert(false);
-          }
-          output.task_processors[idx] = *proc_finder;
-          proc_map[input.tasks[idx]] = *proc_finder;
+          log_mapper.error("Default mapper error. Not enough nodes for must "
+                           "epoch launch of task %s with %ld tasks", 
+                           input.tasks[0]->get_task_name(),
+                           input.tasks.size());
+          assert(false);
+        }
+
+        for (unsigned idx = 0; idx < input.tasks.size(); idx++)
+        {
+          output.task_processors[idx] = all_procs[idx];
+          proc_map[input.tasks[idx]] = all_procs[idx];
+
+          // std::cout << proc << std::endl;
         }
       }
       else
@@ -228,6 +238,8 @@ namespace Legion {
       // Now let's map the constraints, find one requirement to use for
       // mapping each of the constraints, but get the set of fields we
       // care about and the set of logical regions for all the requirements
+      printf("num iters: %lu\n", input.constraints.size());
+      printf("start: %llu\n", Realm::Clock::current_time_in_microseconds());
       for (unsigned cid = 0; cid < input.constraints.size(); cid++)
       {
         const MappingConstraint &constraint = input.constraints[cid];
@@ -254,6 +266,7 @@ namespace Legion {
           needed_fields.insert(task->regions[req_idx].privilege_fields.begin(),
                                task->regions[req_idx].privilege_fields.end());
         }
+        printf("B: %llu\n", Realm::Clock::current_time_in_microseconds());
         // If there wasn't a region requirement that wasn't no access just 
         // pick the first one since this case doesn't make much sense anyway
         if (base_task == NULL)
@@ -264,6 +277,7 @@ namespace Legion {
         }
         Memory target_memory = default_policy_select_target_memory(ctx, 
                                                                    base_proc);
+        printf("C: %llu\n", Realm::Clock::current_time_in_microseconds());
         VariantInfo info = default_find_preferred_variant(*base_task, ctx, 
                true/*needs tight bound*/, true/*cache*/, Processor::LOC_PROC);
         const TaskLayoutConstraintSet &layout_constraints = 
@@ -305,6 +319,7 @@ namespace Legion {
           }
         }
       }
+      printf("finish: %llu\n", Realm::Clock::current_time_in_microseconds());
     }
   };
 };
@@ -315,40 +330,44 @@ static void create_mappers(Machine machine, HighLevelRuntime *runtime, const std
 
   std::vector<Processor>* procs_list = new std::vector<Processor>();
   std::vector<Memory>* sysmems_list = new std::vector<Memory>();
+  std::map<Memory, std::vector<Processor> >* sysmem_local_procs =
+    new std::map<Memory, std::vector<Processor> >();
   std::map<Processor, Memory>* proc_sysmems = new std::map<Processor, Memory>();
+  std::map<Processor, Memory>* proc_regmems = new std::map<Processor, Memory>();
 
   std::vector<Machine::ProcessorMemoryAffinity> proc_mem_affinities;
   machine.get_proc_mem_affinity(proc_mem_affinities);
 
-  {
-    std::set<Memory> sysmems_set;
-    for (unsigned idx = 0; idx < proc_mem_affinities.size(); ++idx) {
-      Machine::ProcessorMemoryAffinity& affinity = proc_mem_affinities[idx];
-      if (affinity.p.kind() == Processor::LOC_PROC) {
-        if (affinity.m.kind() == Memory::SYSTEM_MEM) {
-          (*proc_sysmems)[affinity.p] = affinity.m;
-          sysmems_set.insert(affinity.m);
-        }
+  for (unsigned idx = 0; idx < proc_mem_affinities.size(); ++idx) {
+    Machine::ProcessorMemoryAffinity& affinity = proc_mem_affinities[idx];
+    if (affinity.p.kind() == Processor::LOC_PROC) {
+      if (affinity.m.kind() == Memory::SYSTEM_MEM) {
+        (*proc_sysmems)[affinity.p] = affinity.m;
+        if (proc_regmems->find(affinity.p) == proc_regmems->end())
+          (*proc_regmems)[affinity.p] = affinity.m;
       }
-    }
-
-    for (std::set<Memory>::iterator it = sysmems_set.begin();
-         it != sysmems_set.end(); ++it) {
-      sysmems_list->push_back(*it);
+      else if (affinity.m.kind() == Memory::REGDMA_MEM)
+        (*proc_regmems)[affinity.p] = affinity.m;
     }
   }
 
   for (std::map<Processor, Memory>::iterator it = proc_sysmems->begin();
        it != proc_sysmems->end(); ++it) {
     procs_list->push_back(it->first);
+    (*sysmem_local_procs)[it->second].push_back(it->first);
   }
+
+  for (std::map<Memory, std::vector<Processor> >::iterator it =
+        sysmem_local_procs->begin(); it != sysmem_local_procs->end(); ++it)
+    sysmems_list->push_back(it->first);
 
   for (std::set<Processor>::const_iterator it = local_procs.begin();
         it != local_procs.end(); ++it)
   {
     StencilMapper* mapper = new StencilMapper(runtime->get_mapper_runtime(),
                                               machine, *it, "stencil_mapper",
-                                              procs_list, sysmems_list, proc_sysmems);
+                                              procs_list, sysmems_list, proc_sysmems,
+                                              sysmem_local_procs);
     runtime->replace_default_mapper(mapper, *it);
   }
 }

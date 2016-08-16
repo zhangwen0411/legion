@@ -141,6 +141,7 @@ task stencil(xm : region(ispace(int2d), point),
 where
   reads(xm.input, xp.input, ym.input, yp.input)
 do
+  var proc = c.legion_runtime_get_executing_processor(__runtime(), __context())
   if print_ts then c.printf("t: %ld\n", c.legion_get_current_time_in_micros()) end
 end
 
@@ -169,7 +170,7 @@ task main()
   var tiles = ispace(int2d, nt)
 
   var total_size = 8*(nt.x*radius*n.y*2 + n.x*nt.y*radius*2)
-  c.printf("Total size: %ld bytes.\n", total_size);
+  c.printf("Total size: %lld bytes.\n", total_size);
 
   var xm = region(ispace(int2d, { x = nt.x*radius, y = n.y }), point)
   var xp = region(ispace(int2d, { x = nt.x*radius, y = n.y }), point)

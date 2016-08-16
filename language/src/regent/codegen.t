@@ -4530,7 +4530,7 @@ end
 
 local function make_mapping_call(cx, node, p, i, domain, ispace_type)
   local mapping = node.mapping
-  print(mapping)
+  -- print(mapping)
   if not mapping then
     return values.value (
       node,
