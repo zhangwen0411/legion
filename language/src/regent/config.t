@@ -35,6 +35,7 @@ local default_options = {
   ["flow-spmd-shardsize"] = 1,
   ["flow-spmd-mapping"] = 0,
   ["flow-spmd-mapping-shuffle"] = false,
+  ["flow-spmd-copy-dups"] = 1,
 
   -- Experimental auto-parallelization flags:
   ["parallelize"] = true,
